@@ -27,6 +27,7 @@ Abstract:
 
 #include "mlasi.h"
 #include "mlas_qkv_quant.h"
+#include "qkv_quant_common.h"
 
 void
 MlasFlashAttentionQuantizedKVThreaded(
@@ -49,6 +50,8 @@ MlasFlashAttentionQuantizedKVThreaded(
     const ptrdiff_t local_window_size = static_cast<ptrdiff_t>(args->local_window_size);
     const float scale = args->scale;
     const MLAS_KV_QUANT_TYPE quant_type = args->quant_type;
+    const bool native_int8 = MlasKVQuantInternal::UsesNativeInt8Gemm(quant_type);
+    MlasKVQuantInternal::NativeInt8Workspace int8_workspace;
 
     float* buffer = args->buffer;
     const ptrdiff_t buffer_size_per_thread = static_cast<ptrdiff_t>(args->buffer_size_per_thread);
@@ -135,6 +138,18 @@ MlasFlashAttentionQuantizedKVThreaded(
             static_cast<size_t>(head_idx) * static_cast<size_t>(sequence_length) * static_cast<size_t>(head_size) +
             static_cast<size_t>(q_idx) * static_cast<size_t>(head_size);
 
+        if (native_int8) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareNativeInt8Query(
+                    row_size_q, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int8_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareNativeInt8Query(
+                    row_size_q, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int8_workspace);
+            }
+        }
+
         // Iterate over KV blocks
         for (ptrdiff_t ir = 0; ir < total_seqlen; ir += kv_block_size) {
             const size_t row_size_kv = static_cast<size_t>(std::min(kv_block_size, total_seqlen - ir));
@@ -143,7 +158,11 @@ MlasFlashAttentionQuantizedKVThreaded(
             // K cache at row offset ir: pointer arithmetic on packed rows
             const uint8_t* k_block = k_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
 
-            if (args->query_fp16 != nullptr) {
+            if (native_int8) {
+                MlasKVQuantInternal::NativeInt8QKGemm(
+                    row_size_q, row_size_kv, static_cast<size_t>(head_size), scale, k_block,
+                    scores, row_size_kv, int8_workspace);
+            } else if (args->query_fp16 != nullptr) {
                 MlasQKGemmFp16(
                     row_size_q, static_cast<size_t>(row_size_kv), static_cast<size_t>(head_size), scale,
                     args->query_fp16 + q_offset, static_cast<size_t>(head_size), k_block, quant_type,
@@ -188,7 +207,7 @@ MlasFlashAttentionQuantizedKVThreaded(
             }
 
             // Step 2: Apply causal mask and Step 3: Online softmax update
-            for (ptrdiff_t irow = 0; irow < static_cast<ptrdiff_t>(row_size_q); ++irow) {
+            for (ptrdiff_t irow = 0; irow <static_cast<ptrdiff_t>(row_size_q); ++irow) {
                 float* p = scores + irow * static_cast<ptrdiff_t>(row_size_kv);
                 const ptrdiff_t global_q_pos = past_seqlen + q_idx + irow;
                 const ptrdiff_t causal_limit = global_q_pos + 1;  // can attend to positions [0, causal_limit)
@@ -256,20 +275,17 @@ MlasFlashAttentionQuantizedKVThreaded(
 
             // Step 4: Accumulate O += S_exp * V_block using fused dequant+GEMM
             const uint8_t* v_block = v_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
-            MlasSVGemm(
-                row_size_q,                         // M
-                static_cast<size_t>(head_size),     // N
-                row_size_kv,                        // K
-                scores,                             // A (exp softmax scores)
-                row_size_kv,                        // lda
-                v_block,                            // B (quantized V block)
-                quant_type,
-                head_v_scale,
-                temp_output,                        // C (accumulated output)
-                static_cast<size_t>(head_size),     // ldc
-                1.0f,                               // Beta (accumulate)
-                nullptr                             // no thread pool (already threaded)
-            );
+            if (native_int8) {
+                MlasKVQuantInternal::NativeInt8SVGemm(
+                    row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                    v_block, head_v_scale, temp_output, static_cast<size_t>(head_size),
+                    1.0f, int8_workspace);
+            } else {
+                MlasSVGemm(
+                    row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                    v_block, quant_type, head_v_scale, temp_output, static_cast<size_t>(head_size),
+                    1.0f, nullptr);
+            }
         }
 
         // Final: normalize output by l (softmax denominator)

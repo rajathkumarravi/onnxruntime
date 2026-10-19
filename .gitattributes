@@ -14,3 +14,6 @@
 
 # Git hooks must have Unix line endings to work on all platforms
 .githooks/* text eol=lf
+
+# Preserve upstream LF line endings and significant blank patch-context lines.
+cmake/patches/kleidiai/*.patch text eol=lf whitespace=-blank-at-eol,-blank-at-eof

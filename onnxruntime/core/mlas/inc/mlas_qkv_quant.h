@@ -42,6 +42,14 @@ Abstract:
 
     Symmetric only; no zero points.
 
+    Experimental FP8 modes use one scale per column and byte storage. They
+    dequantize the current attention tile for FP32 GEMM; they do not require
+    or claim hardware FP8 arithmetic.
+
+    The experimental ARM64 native INT8 mode preserves per-channel INT8 KV
+    storage but also dynamically quantizes queries and softmax rows for
+    integer GEMM. It requires finite activations and positive finite scales.
+
 --*/
 
 #pragma once
@@ -64,12 +72,17 @@ enum class MLAS_KV_QUANT_TYPE {
     S8_PerChannel = 1,
     S4_PerTensor = 2,
     S4_PerChannel = 3,
+    F8E4M3FN_PerChannel = 4,
+    F8E5M2_PerChannel = 5,
+    S8_PerChannel_Gemm = 6,
+    S4_PerChannel_Gemm = 7,
+    S8_PerChannel_Native = 8,
 };
 
 /**
  * @brief Returns true if MlasKVQuantize / MlasQKGemm / MlasSVGemm /
  *        MlasKVDequantize are available for the requested mode on the current
- *        platform. Always true for the portable reference implementation.
+ *        platform. The native INT8 mode currently requires ARM64.
  */
 bool
 MLASCALL
@@ -337,6 +350,7 @@ struct MlasFlashAttentionQuantizedKVArgs {
 
     int thread_count = 1;
     float* buffer = nullptr;
+    // Regular tiled scratch needs q_block_size * (2 + kv_block_size + head_size) floats.
     size_t buffer_size_per_thread = 0;
 
     // FP32 vs FP16 activation pointers are mutually exclusive. For each pair below

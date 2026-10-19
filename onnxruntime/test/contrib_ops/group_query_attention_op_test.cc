@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -18,12 +20,18 @@
 #include "gtest/gtest.h"
 #include "contrib_ops/cpu/bert/group_query_attention_helper.h"
 #include "core/common/inlined_containers.h"
+#include "core/common/float8.h"
+#include "core/graph/model.h"
 #include "core/mlas/inc/mlas.h"
+#include "core/mlas/inc/mlas_qkv_quant.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/platform/env.h"
 #include "core/platform/threadpool.h"
+#include "core/providers/cpu/cpu_execution_provider.h"
+#include "core/session/inference_session.h"
 #include "test/common/tensor_op_test_utils.h"
 #include "test/providers/provider_test_utils.h"
+#include "test/test_environment.h"
 #include "test/unittest_util/framework_test_utils.h"
 #include "test/util/include/default_providers.h"
 #include "test/util/include/scoped_env_vars.h"
@@ -32,10 +40,7 @@
 #include "test/common/cuda_op_test_utils.h"
 #endif
 #if defined(USE_CUDA) || defined(USE_WEBGPU)
-#include "core/graph/model.h"
-#include "core/session/inference_session.h"
 #include "core/session/IOBinding.h"
-#include "test/test_environment.h"
 #endif
 #ifdef USE_WEBGPU
 #include "contrib_ops/webgpu/bert/kv_cache_quantization.h"
@@ -46,6 +51,242 @@
 
 namespace onnxruntime {
 namespace test {
+
+namespace {
+
+class GqaScratchRecordingAllocator final : public CPUAllocator {
+ public:
+  void* Alloc(size_t size) override {
+    void* result = CPUAllocator::Alloc(size);
+    std::lock_guard<std::mutex> lock(mutex_);
+    sizes_.push_back(size);
+    return result;
+  }
+
+  bool SawAllocation(size_t size) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::find(sizes_.begin(), sizes_.end(), size) != sizes_.end();
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<size_t> sizes_;
+};
+
+class GqaScratchRecordingCpuEp final : public CPUExecutionProvider {
+ public:
+  explicit GqaScratchRecordingCpuEp(std::shared_ptr<GqaScratchRecordingAllocator> allocator)
+      : CPUExecutionProvider(CPUExecutionProviderInfo(false)), allocator_(std::move(allocator)) {}
+
+  std::vector<AllocatorPtr> CreatePreferredAllocators() override {
+    return {allocator_};
+  }
+
+ private:
+  std::shared_ptr<GqaScratchRecordingAllocator> allocator_;
+};
+
+class GqaScratchOpTester final : public OpTester {
+ public:
+  using OpTester::FillFeedsAndOutputNames;
+  using OpTester::OpTester;
+  using OpTester::SetTestFunctionCalled;
+};
+
+template <typename T, int BatchSize = 2, int QueryLength = 1>
+void RunGqaScratchAllocationTest(contrib::QKOutputType qk_mode = contrib::QKOutputType::NO_OUTPUT,
+                                 bool read_only_cache = false, bool alias_cache = false) {
+  ScopedEnvironmentVariables disable_flash({{"ORT_GQA_DISABLE_FLASH_ATTENTION", "1"}});
+  constexpr int batch_size = BatchSize;
+  constexpr int num_heads = 6;
+  constexpr int kv_heads = 2;
+  constexpr int head_size = 16;
+  constexpr int sequence_length = QueryLength;
+  constexpr int capacity = 97;
+  constexpr int max_live_length = 53;
+  const bool output_qk = qk_mode != contrib::QKOutputType::NO_OUTPUT;
+  std::vector<int32_t> live_lengths(batch_size, max_live_length);
+  if (batch_size > 1 && !output_qk) {
+    live_lengths[0] = 39;
+  }
+  const int kv_sequence_length = read_only_cache ? 0 : sequence_length;
+  const int total_sequence_length = output_qk ? max_live_length : capacity;
+
+  GqaScratchOpTester tester("GroupQueryAttention", 1, kMSDomain);
+  tester.AddAttribute<int64_t>("num_heads", num_heads);
+  tester.AddAttribute<int64_t>("kv_num_heads", kv_heads);
+  tester.AddAttribute<int64_t>("qk_output", static_cast<int64_t>(qk_mode));
+  tester.AddInput<T>("query", {batch_size, sequence_length, num_heads * head_size},
+                     std::vector<T>(batch_size * sequence_length * num_heads * head_size, T(0.0f)));
+  tester.AddInput<T>("key", {batch_size, kv_sequence_length, kv_heads * head_size},
+                     std::vector<T>(batch_size * kv_sequence_length * kv_heads * head_size, T(0.0f)));
+
+  std::vector<T> value(batch_size * kv_sequence_length * kv_heads * head_size, T(0.0f));
+  std::vector<T> past_value(batch_size * kv_heads * capacity * head_size, T(0.0f));
+  std::vector<T> present_value(past_value.size(), T(0.0f));
+  std::vector<T> expected(batch_size * sequence_length * num_heads * head_size, T(0.0f));
+  for (int b = 0; b < batch_size; ++b) {
+    for (int h = 0; h < kv_heads; ++h) {
+      const T head_value(static_cast<float>(b * kv_heads + h + 1) * 0.25f);
+      for (int s = 0; s < live_lengths[b]; ++s) {
+        for (int d = 0; d < head_size; ++d) {
+          const size_t offset = ((b * kv_heads + h) * capacity + s) * head_size + d;
+          present_value[offset] = head_value;
+          if (s < live_lengths[b] - kv_sequence_length) {
+            past_value[offset] = head_value;
+          }
+        }
+      }
+      for (int s = 0; s < kv_sequence_length; ++s) {
+        for (int d = 0; d < head_size; ++d) {
+          value[((b * kv_sequence_length + s) * kv_heads + h) * head_size + d] = head_value;
+        }
+      }
+    }
+    for (int s = 0; s < sequence_length; ++s) {
+      for (int h = 0; h < num_heads; ++h) {
+        const T head_value(static_cast<float>(b * kv_heads + h / (num_heads / kv_heads) + 1) * 0.25f);
+        std::fill_n(expected.begin() + ((b * sequence_length + s) * num_heads + h) * head_size,
+                    head_size, head_value);
+      }
+    }
+  }
+  tester.AddInput<T>("value", {batch_size, kv_sequence_length, kv_heads * head_size}, value);
+  tester.AddInput<T>("past_key", {batch_size, kv_heads, capacity, head_size},
+                     std::vector<T>(past_value.size(), T(0.0f)));
+  tester.AddInput<T>("past_value", {batch_size, kv_heads, capacity, head_size}, past_value);
+  std::vector<int32_t> seqlens_k = live_lengths;
+  for (auto& length : seqlens_k) {
+    --length;
+  }
+  tester.AddInput<int32_t>("seqlens_k", {batch_size}, seqlens_k);
+  // The scalar can describe reserved capacity rather than the live extent.
+  tester.AddInput<int32_t>("total_sequence_length", {1}, {total_sequence_length});
+  tester.AddOptionalInputEdge<T>();
+  tester.AddOptionalInputEdge<T>();
+  tester.AddOptionalInputEdge<int64_t>();
+  tester.AddInput<T>("attention_bias", {batch_size, 1, sequence_length, total_sequence_length},
+                     std::vector<T>(batch_size * sequence_length * total_sequence_length, T(0.0f)));
+  tester.AddOutput<T>("output", {batch_size, sequence_length, num_heads * head_size}, expected);
+  if (!read_only_cache) {
+    tester.AddOutput<T>("present_key", {batch_size, kv_heads, capacity, head_size},
+                        std::vector<T>(past_value.size(), T(0.0f)));
+    tester.AddOutput<T>("present_value", {batch_size, kv_heads, capacity, head_size}, present_value);
+  }
+  if (output_qk) {
+    std::vector<T> scores(batch_size * num_heads * sequence_length * total_sequence_length, T(0.0f));
+    if (qk_mode == contrib::QKOutputType::AFTER_SOFTMAX) {
+      for (int b = 0; b < batch_size; ++b) {
+        for (int h = 0; h < num_heads; ++h) {
+          for (int s = 0; s < sequence_length; ++s) {
+            const int visible_length = live_lengths[b] - sequence_length + s + 1;
+            const size_t offset = ((b * num_heads + h) * sequence_length + s) * total_sequence_length;
+            std::fill_n(scores.begin() + offset, visible_length, T(1.0f / visible_length));
+          }
+        }
+      }
+    }
+    tester.AddOutput<T>("output_qk", {batch_size, num_heads, sequence_length, total_sequence_length}, scores);
+  }
+  const float tolerance = std::is_same_v<T, MLFloat16> ? 0.005f : 1e-5f;
+  tester.SetOutputTolerance(tolerance);
+  auto allocator = std::make_shared<GqaScratchRecordingAllocator>();
+  SessionOptions options;
+  options.enable_cpu_mem_arena = false;
+  options.enable_mem_pattern = false;
+  options.intra_op_param.thread_pool_size = alias_cache ? 3 : 1;
+  if (alias_cache) {
+    ASSERT_FALSE(read_only_cache || output_qk);
+    tester.SetTestFunctionCalled();
+    auto& model = tester.BuildModel();
+    ASSERT_STATUS_OK(model.MainGraph().Resolve());
+    const std::string model_data = model.ToProto().SerializeAsString();
+    InferenceSession session{options, GetEnvironment()};
+    ASSERT_STATUS_OK(session.RegisterExecutionProvider(std::make_unique<GqaScratchRecordingCpuEp>(allocator)));
+    ASSERT_STATUS_OK(session.Load(model_data.data(), static_cast<int>(model_data.size())));
+    ASSERT_STATUS_OK(session.Initialize());
+    NameMLValMap feeds;
+    std::vector<std::string> output_names;
+    tester.FillFeedsAndOutputNames(feeds, output_names);
+    ASSERT_EQ(output_names.size(), 3u);
+    std::vector<OrtValue> fetches{OrtValue{}, feeds.at("past_key"), feeds.at("past_value")};
+    ASSERT_STATUS_OK(session.Run(RunOptions{}, feeds, output_names, &fetches));
+    EXPECT_EQ(fetches[1].Get<Tensor>().DataRaw(), feeds.at("past_key").Get<Tensor>().DataRaw());
+    EXPECT_EQ(fetches[2].Get<Tensor>().DataRaw(), feeds.at("past_value").Get<Tensor>().DataRaw());
+    auto verify = [&](const OrtValue& actual_value, const std::vector<T>& reference) {
+      const auto& tensor = actual_value.Get<Tensor>();
+      ASSERT_EQ(static_cast<size_t>(tensor.Shape().Size()), reference.size());
+      const auto* actual = tensor.Data<T>();
+      for (size_t i = 0; i < reference.size(); ++i) {
+        EXPECT_NEAR(static_cast<float>(actual[i]), static_cast<float>(reference[i]), tolerance) << i;
+      }
+    };
+    verify(fetches[0], expected);
+    verify(fetches[1], std::vector<T>(past_value.size(), T(0.0f)));
+    verify(fetches[2], present_value);
+  } else {
+    tester.Config(options).ConfigEp(std::make_unique<GqaScratchRecordingCpuEp>(allocator)).RunWithConfig();
+  }
+  ASSERT_FALSE(::testing::Test::HasFailure());
+
+  const bool native_type = MlasGQASupported<T>(CblasNoTrans, CblasTrans) &&
+                           MlasGQASupported<T>(CblasNoTrans, CblasNoTrans);
+  const size_t row_bytes = batch_size * num_heads * sequence_length * (native_type ? sizeof(T) : sizeof(float));
+  EXPECT_TRUE(allocator->SawAllocation(row_bytes * (output_qk ? capacity : max_live_length)));
+  if (!output_qk) {
+    EXPECT_FALSE(allocator->SawAllocation(row_bytes * capacity));
+  }
+}
+
+}  // namespace
+
+TEST(GroupQueryAttentionTest, NonFlashScratchLiveLength_Float) {
+  RunGqaScratchAllocationTest<float>();
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchLiveLength_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16>();
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchDomino_Float) {
+  RunGqaScratchAllocationTest<float, 1, 8>();
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchDomino_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16, 1, 8>();
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchAliasedCache_Float) {
+  RunGqaScratchAllocationTest<float, 1, 8>(contrib::QKOutputType::NO_OUTPUT, false, true);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchAliasedCache_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16, 1, 8>(contrib::QKOutputType::NO_OUTPUT, false, true);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchReadOnlyCache_Float) {
+  RunGqaScratchAllocationTest<float>(contrib::QKOutputType::NO_OUTPUT, true);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchReadOnlyCache_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16>(contrib::QKOutputType::NO_OUTPUT, true);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchQKBefore_Float) {
+  RunGqaScratchAllocationTest<float>(contrib::QKOutputType::BEFORE_SOFTMAX);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchQKBefore_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16>(contrib::QKOutputType::BEFORE_SOFTMAX);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchQKAfter_Float) {
+  RunGqaScratchAllocationTest<float>(contrib::QKOutputType::AFTER_SOFTMAX);
+}
+
+TEST(GroupQueryAttentionTest, NonFlashScratchQKAfter_Float16) {
+  RunGqaScratchAllocationTest<MLFloat16>(contrib::QKOutputType::AFTER_SOFTMAX);
+}
 
 #ifdef USE_CUDA
 // Restrict native H512 GQA to supported GPUs and compatible, unquantized grouped-head caches.
@@ -2920,9 +3161,14 @@ struct QuantGQAConfig {
   int bit_width;           // 4 or 8
   bool use_fp16 = false;
   bool disable_flash = false;
+  bool use_decoded_gemm = false;
+  bool use_native_int8 = false;
 };
 
 void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
+  if (cfg.use_native_int8 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
   const int hidden_size = cfg.num_heads * cfg.head_size;
   const int kv_hidden_size = cfg.kv_num_heads * cfg.head_size;
   const int kv_elements = cfg.batch_size * cfg.kv_num_heads * cfg.seq_len * cfg.head_size;
@@ -2948,8 +3194,10 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
   OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
   tester.AddAttribute<int64_t>("num_heads", static_cast<int64_t>(cfg.num_heads));
   tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(cfg.kv_num_heads));
-  tester.AddAttribute<std::string>("k_quant_type", cfg.quant_type);
-  tester.AddAttribute<std::string>("v_quant_type", cfg.quant_type);
+  const auto quant_type = cfg.use_native_int8 ? std::string("PER_CHANNEL_INT8_NATIVE")
+                                            : cfg.use_decoded_gemm ? std::string("PER_CHANNEL_GEMM") : cfg.quant_type;
+  tester.AddAttribute<std::string>("k_quant_type", quant_type);
+  tester.AddAttribute<std::string>("v_quant_type", quant_type);
   tester.AddAttribute<int64_t>("kv_cache_bit_width", static_cast<int64_t>(cfg.bit_width));
 
   if (cfg.use_fp16) {
@@ -3199,7 +3447,7 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
                  cfg.seq_len, cfg.head_size, /*causal=*/true);
 
     // Compare with tolerance
-    float atol = (cfg.bit_width == 4) ? 0.15f : 0.05f;
+    float atol = cfg.use_native_int8 ? 0.01f : (cfg.bit_width == 4) ? 0.15f : 0.05f;
     for (int i = 0; i < output_size; i++) {
       float diff = std::fabs(out_data[i] - ref_output[i]);
       EXPECT_LE(diff, atol)
@@ -3219,7 +3467,10 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
   }
 }
 
-void RunQuantizedGQAFp16DecodeTest(int bit_width) {
+void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false, bool use_native_int8 = false) {
+  if (use_native_int8 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
   constexpr int batch_size = 1;
   constexpr int sequence_length = 1;
   constexpr int cache_length = 2;
@@ -3233,8 +3484,10 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width) {
   OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
   tester.AddAttribute<int64_t>("num_heads", static_cast<int64_t>(num_heads));
   tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(kv_num_heads));
-  tester.AddAttribute<std::string>("k_quant_type", "PER_TENSOR");
-  tester.AddAttribute<std::string>("v_quant_type", "PER_TENSOR");
+  const std::string quant_type = use_native_int8 ? "PER_CHANNEL_INT8_NATIVE"
+                                               : use_decoded_gemm ? "PER_CHANNEL_GEMM" : "PER_TENSOR";
+  tester.AddAttribute<std::string>("k_quant_type", quant_type);
+  tester.AddAttribute<std::string>("v_quant_type", quant_type);
   tester.AddAttribute<int64_t>("kv_cache_bit_width", bit_width);
 
   tester.AddInput<MLFloat16>("query", {batch_size, sequence_length, hidden_size},
@@ -3265,8 +3518,9 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width) {
   tester.AddOptionalInputEdge<MLFloat16>();  // attention_bias
   tester.AddOptionalInputEdge<MLFloat16>();  // head_sink
   const float scale = bit_width == 4 ? 0.05f : 0.01f;
-  tester.AddInput<float>("k_scale", {1}, {scale});
-  tester.AddInput<float>("v_scale", {1}, {scale});
+  const int scale_size = use_decoded_gemm || use_native_int8 ? head_size : 1;
+  tester.AddInput<float>("k_scale", {scale_size}, std::vector<float>(scale_size, scale));
+  tester.AddInput<float>("v_scale", {scale_size}, std::vector<float>(scale_size, scale));
 
   tester.AddOutput<MLFloat16>("output", {batch_size, sequence_length, hidden_size},
                               std::vector<MLFloat16>(hidden_size, MLFloat16(0.2f)));
@@ -3290,6 +3544,38 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width) {
 }
 
 }  // anonymous namespace
+
+TEST(GroupQueryAttentionTest, QuantizedKV_INT8_DecodedGemm_Fp16Decode) {
+  RunQuantizedGQAFp16DecodeTest(8, true);
+}
+
+TEST(GroupQueryAttentionTest, QuantizedKV_INT4_DecodedGemm_Fp16Decode) {
+  RunQuantizedGQAFp16DecodeTest(4, true);
+}
+
+TEST(GroupQueryAttentionTest, QuantizedKV_INT8_DecodedGemm_Fp16Prefill128) {
+  RunQuantizedGQAPromptTest({1, 128, 6, 2, 128, "PER_CHANNEL", 8, true, false, true});
+}
+
+TEST(GroupQueryAttentionTest, QuantizedKV_INT4_DecodedGemm_Fp16Prefill128) {
+  RunQuantizedGQAPromptTest({1, 128, 6, 2, 128, "PER_CHANNEL", 4, true, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16Decode) {
+  RunQuantizedGQAFp16DecodeTest(8, false, true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16Prefill128) {
+  RunQuantizedGQAPromptTest({1, 128, 6, 2, 128, "PER_CHANNEL", 8, true, false, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16EightRows) {
+  RunQuantizedGQAPromptTest({1, 8, 6, 2, 128, "PER_CHANNEL", 8, true, false, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_FloatBatchedNonFlash) {
+  RunQuantizedGQAPromptTest({2, 8, 6, 2, 128, "PER_CHANNEL", 8, false, true, false, true});
+}
 
 // INT8 per-tensor prompt test
 TEST(GroupQueryAttentionTest, QuantizedKV_INT8_PerTensor_Prompt) {
@@ -7551,6 +7837,560 @@ TEST(GroupQueryAttentionTest, WebGPU_BlockQuantInt8_NonPowerOfTwoHeadSize) {
 }
 
 #endif  // USE_WEBGPU
+
+namespace {
+
+void RunNativeInt8MlasTest(size_t m, size_t n, size_t d, bool signed_probabilities = false) {
+  constexpr auto type = MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
+  if (!MlasIsKVQuantGemmSupported(type)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
+  const size_t query_stride = d + 3, score_stride = n + 2, output_stride = d + 3;
+  std::vector<float> scales(d), query(m * query_stride), query_scales(m);
+  std::vector<MLFloat16> half_query(query.size());
+  std::vector<int8_t> cache(n * d + 2, 99), quantized_query(m * d);
+  for (size_t col = 0; col < d; ++col) scales[col] = std::ldexp(1.0f, static_cast<int>(col % 4) - 8);
+  for (size_t i = 0; i < query.size(); ++i) {
+    query[i] = m > 1 && i < query_stride ? 0.0f : static_cast<float>(static_cast<int>(i % 23) - 11) / 32.0f;
+    half_query[i] = MLFloat16(query[i]);
+  }
+  for (size_t i = 0; i < n * d; ++i) cache[i + 1] = static_cast<int8_t>(static_cast<int>(i % 239) - 119);
+  for (size_t row = 0; row < m; ++row) {
+    std::vector<float> scaled(d);
+    float peak = 0;
+    for (size_t col = 0; col < d; ++col) {
+      scaled[col] = query[row * query_stride + col] * scales[col];
+      peak = std::max(peak, std::abs(scaled[col]));
+    }
+    query_scales[row] = peak == 0.0f ? 1.0f : peak / 127.0f;
+    MlasQuantizeLinear(scaled.data(), quantized_query.data() + row * d, d, query_scales[row], int8_t{0});
+  }
+  std::vector<float> scores(m * score_stride, 123.0f), half_scores(scores);
+  MlasQKGemm(m, n, d, 0.125f, query.data(), query_stride, cache.data() + 1,
+             type, scales.data(), scores.data(), score_stride, nullptr);
+  MlasQKGemmFp16(m, n, d, 0.125f, half_query.data(), query_stride, cache.data() + 1,
+                 type, scales.data(), half_scores.data(), score_stride, nullptr);
+  for (size_t row = 0; row < m; ++row) {
+    for (size_t col = 0; col < n; ++col) {
+      int32_t dot = 0;
+      for (size_t k = 0; k < d; ++k) {
+        dot += static_cast<int32_t>(quantized_query[row * d + k]) * cache[1 + col * d + k];
+      }
+      const float expected = static_cast<float>(dot) * (0.125f * query_scales[row]);
+      EXPECT_FLOAT_EQ(scores[row * score_stride + col], expected);
+      EXPECT_FLOAT_EQ(half_scores[row * score_stride + col], expected);
+    }
+    EXPECT_FLOAT_EQ(scores[row * score_stride + n], 123.0f);
+    EXPECT_FLOAT_EQ(half_scores[row * score_stride + n], 123.0f);
+  }
+  std::vector<uint8_t> probabilities(m * n);
+  std::vector<float> probability_scales(m);
+  for (size_t row = 0; row < m; ++row) {
+    float peak = 0;
+    for (size_t col = 0; col < n; ++col) {
+      const int value = static_cast<int>((row * n + col) % 31);
+      scores[row * score_stride + col] =
+          m > 1 && row == 0 ? 0.0f : static_cast<float>(value - (signed_probabilities ? 15 : 0)) / 32.0f;
+      peak = std::max(peak, std::abs(scores[row * score_stride + col]));
+    }
+    probability_scales[row] = peak == 0.0f ? 1.0f : peak / (signed_probabilities ? 127.0f : 255.0f);
+    if (signed_probabilities) {
+      MlasQuantizeLinear(scores.data() + row * score_stride,
+                         reinterpret_cast<int8_t*>(probabilities.data() + row * n),
+                         n, probability_scales[row], int8_t{0});
+    } else {
+      MlasQuantizeLinear(scores.data() + row * score_stride, probabilities.data() + row * n,
+                         n, probability_scales[row], uint8_t{0});
+    }
+  }
+  for (float beta : {0.0f, 0.5f, 1.0f}) {
+    std::vector<float> output(m * output_stride, 0.25f);
+    std::vector<MLFloat16> half_output(output.size(), MLFloat16(0.25f));
+    if (beta == 0.0f) {
+      for (size_t row = 0; row < m; ++row) {
+        std::fill_n(output.data() + row * output_stride, d, std::numeric_limits<float>::quiet_NaN());
+        std::fill_n(half_output.data() + row * output_stride, d,
+                    MLFloat16(std::numeric_limits<float>::quiet_NaN()));
+      }
+    }
+    MlasSVGemm(m, d, n, scores.data(), score_stride, cache.data() + 1, type, scales.data(),
+               output.data(), output_stride, beta, nullptr);
+    MlasSVGemmFp16(m, d, n, scores.data(), score_stride, cache.data() + 1, type, scales.data(),
+                   half_output.data(), output_stride, beta, nullptr);
+    for (size_t row = 0; row < m; ++row) {
+      for (size_t col = 0; col < d; ++col) {
+        int32_t dot = 0;
+        for (size_t k = 0; k < n; ++k) {
+          const int32_t value = signed_probabilities
+                                    ? reinterpret_cast<const int8_t*>(probabilities.data())[row * n + k]
+                                    : probabilities[row * n + k];
+          dot += value * cache[1 + k * d + col];
+        }
+        const float expected = beta * 0.25f +
+                               static_cast<float>(dot) * probability_scales[row] * scales[col];
+        EXPECT_NEAR(output[row * output_stride + col], expected, 0.00001f);
+        EXPECT_FLOAT_EQ(half_output[row * output_stride + col].ToFloat(), MLFloat16(expected).ToFloat());
+      }
+      EXPECT_FLOAT_EQ(output[row * output_stride + d], 0.25f);
+      EXPECT_FLOAT_EQ(half_output[row * output_stride + d].ToFloat(), 0.25f);
+    }
+  }
+  EXPECT_EQ(cache.front(), 99);
+  EXPECT_EQ(cache.back(), 99);
+}
+
+void RunNativeInt8MaskedDecodeTest(bool invalid_scale = false, bool unsigned_storage = false) {
+  if (!MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
+  constexpr int heads = 6, kv_heads = 2, d = 128, past = 5, sequence = 8, capacity = past + sequence;
+  std::vector<float> scales(kv_heads * d);
+  std::vector<int8_t> past_key(kv_heads * capacity * d), past_value(past_key.size());
+  std::vector<int8_t> present_value(past_value.size());
+  std::vector<MLFloat16> new_value(sequence * kv_heads * d), expected(sequence * heads * d);
+  for (int h = 0; h < kv_heads; ++h) {
+    for (int col = 0; col < d; ++col) {
+      const float scale = std::ldexp(1.0f, col % 4 - 7);
+      scales[h * d + col] = scale;
+      const int8_t old_value = static_cast<int8_t>(col % 7 - 4 * (h + 1));
+      const int8_t current_value = static_cast<int8_t>(old_value + 5);
+      for (int row = 0; row < capacity; ++row) {
+        const int offset = (h * capacity + row) * d + col;
+        past_value[offset] = row < past ? old_value : 0;
+        present_value[offset] = row < past ? old_value : current_value;
+      }
+      for (int row = 0; row < sequence; ++row) {
+        new_value[(row * kv_heads + h) * d + col] = MLFloat16(current_value * scale);
+        const float average = ((past - 1) * old_value + (row + 1) * current_value) *
+                              scale / (past + row);
+        for (int group = 0; group < heads / kv_heads; ++group) {
+          expected[(row * heads + h * (heads / kv_heads) + group) * d + col] = MLFloat16(average);
+        }
+      }
+    }
+  }
+  OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
+  tester.AddAttribute<int64_t>("num_heads", heads);
+  tester.AddAttribute<int64_t>("kv_num_heads", kv_heads);
+  tester.AddAttribute<std::string>("k_quant_type", "PER_CHANNEL_INT8_NATIVE");
+  tester.AddAttribute<std::string>("v_quant_type", "PER_CHANNEL_INT8_NATIVE");
+  tester.AddAttribute<int64_t>("kv_cache_bit_width", 8);
+  tester.AddInput<MLFloat16>("query", {1, sequence, heads * d},
+                             std::vector<MLFloat16>(sequence * heads * d, MLFloat16(0.0f)));
+  tester.AddInput<MLFloat16>("key", {1, sequence, kv_heads * d},
+                             std::vector<MLFloat16>(sequence * kv_heads * d, MLFloat16(0.0f)));
+  tester.AddInput<MLFloat16>("value", {1, sequence, kv_heads * d}, new_value);
+  if (unsigned_storage) {
+    tester.AddInput<uint8_t>("past_key", {1, kv_heads, capacity, d},
+                             std::vector<uint8_t>(past_key.begin(), past_key.end()));
+    tester.AddInput<uint8_t>("past_value", {1, kv_heads, capacity, d},
+                             std::vector<uint8_t>(past_value.begin(), past_value.end()));
+  } else {
+    tester.AddInput<int8_t>("past_key", {1, kv_heads, capacity, d}, past_key);
+    tester.AddInput<int8_t>("past_value", {1, kv_heads, capacity, d}, past_value);
+  }
+  tester.AddInput<int32_t>("seqlens_k", {1}, {capacity - 1});
+  tester.AddInput<int32_t>("total_sequence_length", {1}, {capacity});
+  tester.AddOptionalInputEdge<MLFloat16>();
+  tester.AddOptionalInputEdge<MLFloat16>();
+  tester.AddOptionalInputEdge<int64_t>();
+  std::vector<MLFloat16> bias(sequence * capacity, MLFloat16(0.0f));
+  for (int row = 0; row < sequence; ++row) {
+    bias[row * capacity + 1] = MLFloat16(-std::numeric_limits<float>::infinity());
+  }
+  tester.AddInput<MLFloat16>("attention_bias", {1, 1, sequence, capacity}, bias);
+  tester.AddOptionalInputEdge<MLFloat16>();
+  auto key_scales = scales;
+  if (invalid_scale) key_scales[0] = 0.0f;
+  tester.AddInput<float>("k_scale", {kv_heads, d}, key_scales);
+  tester.AddInput<float>("v_scale", {kv_heads, d}, scales);
+  tester.AddOutput<MLFloat16>("output", {1, sequence, heads * d}, expected);
+  if (unsigned_storage) {
+    tester.AddOutput<uint8_t>("present_key", {1, kv_heads, capacity, d},
+                              std::vector<uint8_t>(past_key.begin(), past_key.end()));
+    tester.AddOutput<uint8_t>("present_value", {1, kv_heads, capacity, d},
+                              std::vector<uint8_t>(present_value.begin(), present_value.end()));
+  } else {
+    tester.AddOutput<int8_t>("present_key", {1, kv_heads, capacity, d}, past_key);
+    tester.AddOutput<int8_t>("present_value", {1, kv_heads, capacity, d}, present_value);
+  }
+  tester.SetOutputAbsErr("output", 0.001f);
+  std::vector<std::unique_ptr<IExecutionProvider>> providers;
+  providers.push_back(DefaultCpuExecutionProvider());
+  const char* error = invalid_scale      ? "Native INT8 KV scales must be finite and positive"
+                      : unsigned_storage ? "Native INT8 KV requires signed int8 storage"
+                                         : "";
+  tester.Run(invalid_scale || unsigned_storage ? OpTester::ExpectResult::kExpectFailure
+                                               : OpTester::ExpectResult::kExpectSuccess,
+             error, {}, nullptr, &providers);
+}
+
+}  // namespace
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasSingleRowTails) {
+  RunNativeInt8MlasTest(1, 37, 7);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasEightRows) {
+  RunNativeInt8MlasTest(8, 37, 128);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasPrefill128) {
+  RunNativeInt8MlasTest(128, 65, 128);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasSignedWeights) {
+  RunNativeInt8MlasTest(8, 17, 13, true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16MaskedDecode) {
+  RunNativeInt8MaskedDecodeTest();
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
+  constexpr auto type = MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
+  if (!MlasIsKVQuantGemmSupported(type)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
+  constexpr int batches = 2, heads = 6, kv_heads = 2, d = 7, sequence = 11, past = 17;
+  constexpr int total = past + sequence, capacity = total + 3, q_block = 4, kv_block = 6;
+  constexpr int threads = 3, guard = 17, bias_stride = total + 2;
+  constexpr int q_batch_stride = heads * sequence * d + 5;
+  constexpr int output_count = batches * sequence * heads * d;
+  constexpr int scratch_count = q_block * (2 + kv_block + d);
+  constexpr float sentinel = -1234.0f;
+  std::vector<float> query(batches * q_batch_stride), key_scales(kv_heads * d), value_scales(kv_heads * d);
+  std::vector<MLFloat16> query_fp16(query.size());
+  std::vector<int8_t> key(batches * kv_heads * capacity * d), value(key.size());
+  for (size_t i = 0; i < query.size(); ++i) {
+    query[i] = static_cast<float>(static_cast<int>(i % 37) - 18) * 0.125f;
+    query_fp16[i] = MLFloat16(query[i]);
+  }
+  for (size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<int8_t>(static_cast<int>(i % 63) - 31);
+    value[i] = static_cast<int8_t>(static_cast<int>((i * 7) % 61) - 30);
+  }
+  for (size_t i = 0; i < key_scales.size(); ++i) {
+    key_scales[i] = 0.01f + 0.003f * static_cast<float>(i % 4);
+    value_scales[i] = 0.02f + 0.002f * static_cast<float>(i % 5);
+  }
+  for (bool fp16 : {false, true}) {
+    for (bool broadcast_batch : {false, true}) {
+      for (bool broadcast_head : {false, true}) {
+        for (int window : {-1, 5}) {
+          SCOPED_TRACE(testing::Message() << fp16 << "," << broadcast_batch << "," << broadcast_head << "," << window);
+          const int bias_heads = broadcast_head ? 1 : heads;
+          std::vector<float> bias((broadcast_batch ? 1 : batches) * bias_heads * sequence * bias_stride);
+          std::vector<MLFloat16> bias_fp16(bias.size());
+          for (size_t i = 0; i < bias.size(); ++i) {
+            bias[i] = i % 13 == 0 ? -10000.0f : static_cast<float>(i % 7) * 0.125f;
+            bias_fp16[i] = MLFloat16(bias[i]);
+          }
+          std::vector<float> output(output_count + 2 * guard, sentinel);
+          std::vector<MLFloat16> output_fp16(output.size(), MLFloat16(sentinel));
+          std::vector<float> scratch(threads * scratch_count + 2 * guard, sentinel);
+          MlasFlashAttentionQuantizedKVArgs args;
+          args.batch_size = batches;
+          args.num_heads = heads;
+          args.kv_num_heads = kv_heads;
+          args.sequence_length = sequence;
+          args.total_seqlen = total;
+          args.head_size = d;
+          args.past_seqlen = past;
+          args.local_window_size = window;
+          args.seqlen_present_kv = capacity;
+          args.q_block_size = q_block;
+          args.kv_block_size = kv_block;
+          args.scale = 0.125f;
+          args.quant_type = type;
+          args.per_channel_k = args.per_channel_v = true;
+          args.thread_count = threads;
+          args.buffer = scratch.data() + guard;
+          args.buffer_size_per_thread = scratch_count * sizeof(float);
+          args.query = fp16 ? nullptr : query.data();
+          args.query_fp16 = fp16 ? query_fp16.data() : nullptr;
+          args.q_batch_stride = q_batch_stride;
+          args.k_cache = reinterpret_cast<const uint8_t*>(key.data());
+          args.v_cache = reinterpret_cast<const uint8_t*>(value.data());
+          args.k_scale = key_scales.data();
+          args.v_scale = value_scales.data();
+          args.output = fp16 ? nullptr : output.data() + guard;
+          args.output_fp16 = fp16 ? output_fp16.data() + guard : nullptr;
+          args.attention_bias = fp16 ? nullptr : bias.data();
+          args.attention_bias_fp16 = fp16 ? bias_fp16.data() : nullptr;
+          args.attention_bias_seqlen_stride = bias_stride;
+          args.attention_bias_broadcast_batch = broadcast_batch;
+          args.attention_bias_broadcast_head = broadcast_head;
+          MlasFlashAttentionQuantizedKV(&args, nullptr);
+
+          // Isolated heads retain identical tiles, quantization, and online-softmax ordering.
+          std::vector<float> reference(sequence * d), reference_scratch(scratch_count);
+          std::vector<MLFloat16> reference_fp16(reference.size());
+          for (int batch = 0; batch < batches; ++batch) {
+            for (int head = 0; head < heads; ++head) {
+              auto single = args;
+              single.batch_size = single.num_heads = single.kv_num_heads = single.thread_count = 1;
+              single.buffer = reference_scratch.data();
+              single.buffer_size_per_thread = q_block * (2 + kv_block + d) * sizeof(float);
+              const int q_offset = batch * q_batch_stride + head * sequence * d;
+              single.query = fp16 ? nullptr : query.data() + q_offset;
+              single.query_fp16 = fp16 ? query_fp16.data() + q_offset : nullptr;
+              const int kv_head = head / (heads / kv_heads);
+              const int kv_offset = (batch * kv_heads + kv_head) * capacity * d;
+              single.k_cache = args.k_cache + kv_offset;
+              single.v_cache = args.v_cache + kv_offset;
+              single.k_scale = key_scales.data() + kv_head * d;
+              single.v_scale = value_scales.data() + kv_head * d;
+              single.output = fp16 ? nullptr : reference.data();
+              single.output_fp16 = fp16 ? reference_fp16.data() : nullptr;
+              const int bias_offset =
+                  ((broadcast_batch ? 0 : batch) * bias_heads + (broadcast_head ? 0 : head)) * sequence * bias_stride;
+              single.attention_bias = fp16 ? nullptr : bias.data() + bias_offset;
+              single.attention_bias_fp16 = fp16 ? bias_fp16.data() + bias_offset : nullptr;
+              MlasFlashAttentionQuantizedKV(&single, nullptr);
+              for (int row = 0; row < sequence; ++row) {
+                for (int col = 0; col < d; ++col) {
+                  const int index = guard + ((batch * sequence + row) * heads + head) * d + col;
+                  if (fp16) {
+                    ASSERT_EQ(output_fp16[index].val, reference_fp16[row * d + col].val);
+                  } else {
+                    ASSERT_EQ(output[index], reference[row * d + col]);
+                  }
+                }
+              }
+            }
+          }
+          for (int i = 0; i < guard; ++i) {
+            EXPECT_EQ(scratch[i], sentinel);
+            EXPECT_EQ(scratch[guard + threads * scratch_count + i], sentinel);
+            EXPECT_EQ(output[i], sentinel);
+            EXPECT_EQ(output[guard + output_count + i], sentinel);
+            EXPECT_EQ(output_fp16[i].val, MLFloat16(sentinel).val);
+            EXPECT_EQ(output_fp16[guard + output_count + i].val, MLFloat16(sentinel).val);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_RejectsNonpositiveScales) {
+  RunNativeInt8MaskedDecodeTest(true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_RejectsUnsignedStorage) {
+  RunNativeInt8MaskedDecodeTest(false, true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_RejectsNonfiniteActivations) {
+  constexpr auto type = MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
+  if (!MlasIsKVQuantGemmSupported(type)) {
+    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
+  std::vector<float> input(8, 1.0f), scales(8, 0.01f), output(8);
+  std::vector<int8_t> cache(64, 1);
+  for (float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()}) {
+    input[3] = invalid;
+    EXPECT_THROW(MlasQKGemm(1, 8, 8, 1.0f, input.data(), 8, cache.data(), type, scales.data(),
+                            output.data(), 8, nullptr), OnnxRuntimeException);
+    EXPECT_THROW(MlasSVGemm(1, 8, 8, input.data(), 8, cache.data(), type, scales.data(),
+                            output.data(), 8, 0.0f, nullptr), OnnxRuntimeException);
+  }
+}
+
+#if !defined(DISABLE_FLOAT8_TYPES)
+namespace {
+
+uint8_t Fp8KvBits(float value, bool e5m2) {
+  return e5m2 ? Float8E5M2(value, true).val : Float8E4M3FN(value, true).val;
+}
+
+float Fp8KvValue(uint8_t value, bool e5m2) {
+  return e5m2 ? Float8E5M2(value, Float8E5M2::FromBits()).ToFloat()
+              : Float8E4M3FN(value, Float8E4M3FN::FromBits()).ToFloat();
+}
+
+void RunFp8KvMlasTest(bool e5m2) {
+  constexpr size_t m = 8, n = 37, d = 128;
+  constexpr size_t query_stride = d + 3, source_stride = d + 5, score_stride = n + 2, output_stride = d + 3;
+  const auto type = e5m2 ? MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel : MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel;
+  ASSERT_TRUE(MlasIsKVQuantGemmSupported(type));
+  ASSERT_EQ(MlasKVQuantPackedRowBytes(type, d), d);
+  std::vector<float> scales(d), query(m * query_stride), source(n * source_stride), decoded(n * d);
+  std::vector<MLFloat16> half_query(query.size()), half_source(source.size());
+  for (size_t i = 0; i < d; ++i) scales[i] = std::ldexp(1.0f, static_cast<int>(i % 4) - 6);
+  for (size_t i = 0; i < query.size(); ++i) {
+    query[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 31) - 15);
+    half_query[i] = MLFloat16(query[i]);
+  }
+  for (size_t i = 0; i < source.size(); ++i) {
+    source[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 47) - 23);
+    half_source[i] = MLFloat16(source[i]);
+  }
+  std::vector<uint8_t> packed(n * d + 2, 0xa5), half_packed(n * d + 2, 0xa5);
+  MlasKVQuantize(source.data(), packed.data() + 1, n, d, source_stride, type, scales.data(), nullptr);
+  MlasKVQuantizeFp16(half_source.data(), half_packed.data() + 1, n, d, source_stride, type, scales.data(), nullptr);
+  ASSERT_EQ(packed, half_packed);
+  EXPECT_EQ(packed.front(), 0xa5);
+  EXPECT_EQ(packed.back(), 0xa5);
+  for (size_t row = 0; row < n; ++row) {
+    for (size_t col = 0; col < d; ++col) {
+      const auto expected = Fp8KvBits(source[row * source_stride + col] / scales[col], e5m2);
+      ASSERT_EQ(packed[1 + row * d + col], expected);
+      decoded[row * d + col] = Fp8KvValue(expected, e5m2) * scales[col];
+    }
+  }
+  std::vector<float> dequantized(n * (d + 1), 123.0f);
+  MlasKVDequantize(packed.data() + 1, dequantized.data(), n, d, d + 1, type, scales.data(), nullptr);
+  for (size_t row = 0; row < n; ++row) {
+    for (size_t col = 0; col < d; ++col) EXPECT_FLOAT_EQ(dequantized[row * (d + 1) + col], decoded[row * d + col]);
+    EXPECT_FLOAT_EQ(dequantized[row * (d + 1) + d], 123.0f);
+  }
+  std::vector<float> scores(m * score_stride, 123.0f), half_scores(scores);
+  MlasQKGemm(m, n, d, 0.125f, query.data(), query_stride, packed.data() + 1,
+             type, scales.data(), scores.data(), score_stride, nullptr);
+  MlasQKGemmFp16(m, n, d, 0.125f, half_query.data(), query_stride, packed.data() + 1,
+                 type, scales.data(), half_scores.data(), score_stride, nullptr);
+  for (size_t row = 0; row < m; ++row) {
+    for (size_t col = 0; col < n; ++col) {
+      float expected = 0;
+      for (size_t k = 0; k < d; ++k) expected += query[row * query_stride + k] * decoded[col * d + k];
+      EXPECT_NEAR(scores[row * score_stride + col], expected * 0.125f, 0.0002f);
+      EXPECT_NEAR(half_scores[row * score_stride + col], expected * 0.125f, 0.0002f);
+    }
+    EXPECT_FLOAT_EQ(scores[row * score_stride + n], 123.0f);
+    EXPECT_FLOAT_EQ(half_scores[row * score_stride + n], 123.0f);
+  }
+  for (size_t i = 0; i < scores.size(); ++i) scores[i] = static_cast<float>(i % 13) / 128.0f;
+  for (float beta : {0.0f, 0.5f, 1.0f}) {
+    std::vector<float> output(m * output_stride, 0.25f);
+    std::vector<MLFloat16> half_output(output.size(), MLFloat16(0.25f));
+    MlasSVGemm(m, d, n, scores.data(), score_stride, packed.data() + 1, type, scales.data(),
+               output.data(), output_stride, beta, nullptr);
+    MlasSVGemmFp16(m, d, n, scores.data(), score_stride, packed.data() + 1, type, scales.data(),
+                   half_output.data(), output_stride, beta, nullptr);
+    for (size_t row = 0; row < m; ++row) {
+      for (size_t col = 0; col < d; ++col) {
+        float expected = beta * 0.25f;
+        for (size_t k = 0; k < n; ++k) expected += scores[row * score_stride + k] * decoded[k * d + col];
+        EXPECT_NEAR(output[row * output_stride + col], expected, 0.0002f);
+        EXPECT_NEAR(half_output[row * output_stride + col].ToFloat(), expected, 0.002f);
+      }
+      EXPECT_FLOAT_EQ(output[row * output_stride + d], 0.25f);
+      EXPECT_FLOAT_EQ(half_output[row * output_stride + d].ToFloat(), 0.25f);
+    }
+  }
+}
+
+void RunFp8KvDecodeTest(bool e5m2, bool invalid_scale = false, bool unsigned_storage = false) {
+  constexpr int heads = 4, kv_heads = 2, d = 128, past = 5, sequence = 8, capacity = past + sequence;
+  const std::string type = e5m2 ? "FP8E5M2_PER_CHANNEL" : "FP8E4M3FN_PER_CHANNEL";
+  std::vector<float> scales(kv_heads * d);
+  std::vector<uint8_t> past_key(kv_heads * capacity * d), past_value(past_key.size());
+  std::vector<uint8_t> present_value(past_value.size());
+  std::vector<MLFloat16> new_value(sequence * kv_heads * d), expected(sequence * heads * d);
+  for (int h = 0; h < kv_heads; ++h) {
+    for (int col = 0; col < d; ++col) {
+      const float scale = std::ldexp(1.0f, col % 4 - 6);
+      scales[h * d + col] = scale;
+      const float old_value = 0.5f + 0.5f * h + 0.125f * (col % 4);
+      const float current_value = old_value + 1.0f;
+      const uint8_t old_bits = Fp8KvBits(old_value / scale, e5m2);
+      const uint8_t new_bits = Fp8KvBits(current_value / scale, e5m2);
+      for (int row = 0; row < capacity; ++row) {
+        const int offset = (h * capacity + row) * d + col;
+        past_value[offset] = row < past ? old_bits : 0;
+        present_value[offset] = row < past ? old_bits : new_bits;
+      }
+      for (int row = 0; row < sequence; ++row) {
+        new_value[(row * kv_heads + h) * d + col] = MLFloat16(current_value);
+        const float average = (past * Fp8KvValue(old_bits, e5m2) + (row + 1) * Fp8KvValue(new_bits, e5m2)) *
+                              scale / (past + row + 1);
+        for (int group = 0; group < heads / kv_heads; ++group) {
+          expected[(row * heads + h * (heads / kv_heads) + group) * d + col] = MLFloat16(average);
+        }
+      }
+    }
+  }
+  OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
+  tester.AddAttribute<int64_t>("num_heads", heads);
+  tester.AddAttribute<int64_t>("kv_num_heads", kv_heads);
+  tester.AddAttribute<std::string>("k_quant_type", type);
+  tester.AddAttribute<std::string>("v_quant_type", type);
+  tester.AddAttribute<int64_t>("kv_cache_bit_width", 8);
+  tester.AddInput<MLFloat16>("query", {1, sequence, heads * d},
+                             std::vector<MLFloat16>(sequence * heads * d, MLFloat16(0.0f)));
+  tester.AddInput<MLFloat16>("key", {1, sequence, kv_heads * d},
+                             std::vector<MLFloat16>(sequence * kv_heads * d, MLFloat16(0.0f)));
+  tester.AddInput<MLFloat16>("value", {1, sequence, kv_heads * d}, new_value);
+  if (unsigned_storage) {
+    tester.AddInput<uint8_t>("past_key", {1, kv_heads, capacity, d}, past_key);
+    tester.AddInput<uint8_t>("past_value", {1, kv_heads, capacity, d}, past_value);
+  } else {
+    tester.AddInput<int8_t>("past_key", {1, kv_heads, capacity, d},
+                            std::vector<int8_t>(past_key.begin(), past_key.end()));
+    tester.AddInput<int8_t>("past_value", {1, kv_heads, capacity, d},
+                            std::vector<int8_t>(past_value.begin(), past_value.end()));
+  }
+  tester.AddInput<int32_t>("seqlens_k", {1}, {capacity - 1});
+  tester.AddInput<int32_t>("total_sequence_length", {1}, {capacity});
+  tester.AddOptionalInputEdge<MLFloat16>();
+  tester.AddOptionalInputEdge<MLFloat16>();
+  tester.AddOptionalInputEdge<int64_t>();
+  tester.AddOptionalInputEdge<MLFloat16>();
+  tester.AddOptionalInputEdge<MLFloat16>();
+  auto key_scales = scales;
+  if (invalid_scale) key_scales[0] = 0.0f;
+  tester.AddInput<float>("k_scale", {kv_heads, d}, key_scales);
+  tester.AddInput<float>("v_scale", {kv_heads, d}, scales);
+  tester.AddOutput<MLFloat16>("output", {1, sequence, heads * d}, expected);
+  if (unsigned_storage) {
+    tester.AddOutput<uint8_t>("present_key", {1, kv_heads, capacity, d}, past_key);
+    tester.AddOutput<uint8_t>("present_value", {1, kv_heads, capacity, d}, present_value);
+  } else {
+    tester.AddOutput<int8_t>("present_key", {1, kv_heads, capacity, d},
+                             std::vector<int8_t>(past_key.begin(), past_key.end()));
+    tester.AddOutput<int8_t>("present_value", {1, kv_heads, capacity, d},
+                             std::vector<int8_t>(present_value.begin(), present_value.end()));
+  }
+  tester.SetOutputAbsErr("output", 0.005f);
+  std::vector<std::unique_ptr<IExecutionProvider>> providers;
+  providers.push_back(DefaultCpuExecutionProvider());
+  const char* error = invalid_scale      ? "FP8 KV scales must be finite and positive"
+                      : unsigned_storage ? "CPU FP8 KV requires int8 byte storage"
+                                         : "";
+  tester.Run(invalid_scale || unsigned_storage ? OpTester::ExpectResult::kExpectFailure
+                                               : OpTester::ExpectResult::kExpectSuccess,
+             error, {}, nullptr, &providers);
+}
+
+}  // namespace
+
+TEST(GroupQueryAttentionTest, Fp8KV_E4M3FN_MlasStridesAndAccumulation) {
+  RunFp8KvMlasTest(false);
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_E5M2_MlasStridesAndAccumulation) {
+  RunFp8KvMlasTest(true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_E4M3FN_Fp16EightTokenDecode) {
+  RunFp8KvDecodeTest(false);
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_E5M2_Fp16EightTokenDecode) {
+  RunFp8KvDecodeTest(true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_RejectsNonpositiveScales) {
+  RunFp8KvDecodeTest(false, true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_RejectsUnsignedStorage) {
+  RunFp8KvDecodeTest(false, false, true);
+}
+#endif
 
 }  // namespace test
 }  // namespace onnxruntime

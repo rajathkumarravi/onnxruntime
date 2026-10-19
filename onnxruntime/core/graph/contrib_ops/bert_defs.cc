@@ -1490,8 +1490,20 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "Output values of QK matrix multiplication before (1) or after (2) softmax normalization. Default value is 0 (don't output).",
               AttributeProto::INT,
               static_cast<int64_t>(QKOutputType::NO_OUTPUT))
-        .Attr("k_quant_type", "Quantization type for K cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL'.", AttributeProto::STRING, std::string("NONE"))
-        .Attr("v_quant_type", "Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL'.", AttributeProto::STRING, std::string("NONE"))
+        .Attr("k_quant_type",
+              "Quantization type for K cache: NONE, PER_TENSOR, or PER_CHANNEL. Experimental CPU-only "
+              "FP8E4M3FN_PER_CHANNEL and FP8E5M2_PER_CHANNEL use int8 byte storage, positive per-channel "
+              "scales, kv_cache_bit_width=8, and FP32 attention arithmetic. CPU-only PER_CHANNEL_GEMM "
+              "uses the INT4/INT8 per-channel encoding with tile dequantization followed by FP32 GEMM. "
+              "Experimental ARM64-only PER_CHANNEL_INT8_NATIVE uses signed INT8 KV storage, dynamically "
+              "quantized query and softmax rows, INT32 GEMM accumulation, and FP32 softmax/output accumulation. "
+              "It requires positive per-channel scales and kv_cache_bit_width=8 and adds activation quantization.",
+              AttributeProto::STRING, std::string("NONE"))
+        .Attr("v_quant_type",
+              "Quantization type for V cache: NONE, PER_TENSOR, or PER_CHANNEL. Experimental CPU-only "
+              "FP8E4M3FN_PER_CHANNEL, FP8E5M2_PER_CHANNEL, PER_CHANNEL_GEMM, and PER_CHANNEL_INT8_NATIVE "
+              "require the same format as K.",
+              AttributeProto::STRING, std::string("NONE"))
         .Attr("kv_cache_bit_width", "Bit width of quantized KV cache. Supported values are 8 and 4.", AttributeProto::INT, OPTIONAL_VALUE)
         .Attr("qk_norm_epsilon",
               "Epsilon used by the per-head RMS norm applied to Q and K when q_norm_weight and k_norm_weight inputs are provided. "

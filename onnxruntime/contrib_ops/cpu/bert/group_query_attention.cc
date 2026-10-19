@@ -15,6 +15,7 @@
 
 #include <unsupported/Eigen/SpecialFunctions>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <optional>
 #include <vector>
@@ -221,6 +222,7 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
   const Tensor* head_sink = context->Input<Tensor>(11);
   const Tensor* k_scale = context->Input<Tensor>(12);
   const Tensor* v_scale = context->Input<Tensor>(13);
+  const bool native_int8 = mlas_kv_quant_type_ == MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
 
   // Validate quantization configuration.
   if (kv_quant_enabled_) {
@@ -236,6 +238,14 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
                   "k_scale must be float tensor");
     ORT_RETURN_IF(v_scale->DataType() != DataTypeImpl::GetType<float>(),
                   "v_scale must be float tensor");
+    ORT_RETURN_IF(kv_cache_is_fp8_ &&
+                      ((past_key != nullptr && past_key->DataType() != DataTypeImpl::GetType<int8_t>()) ||
+                       (past_value != nullptr && past_value->DataType() != DataTypeImpl::GetType<int8_t>())),
+                  "CPU FP8 KV requires int8 byte storage");
+    ORT_RETURN_IF(native_int8 &&
+                      ((past_key != nullptr && past_key->DataType() != DataTypeImpl::GetType<int8_t>()) ||
+                       (past_value != nullptr && past_value->DataType() != DataTypeImpl::GetType<int8_t>())),
+                  "Native INT8 KV requires signed int8 storage");
   } else {
     ORT_RETURN_IF(kv_cache_bit_width_ != 0,
                   "kv_cache_bit_width must be 0 when quantization is disabled, got ", kv_cache_bit_width_);
@@ -303,6 +313,14 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
     ORT_RETURN_IF(v_scale->Shape().Size() != expected_scale_size,
                   "v_scale shape mismatch: expected ", expected_scale_size,
                   " elements, got ", v_scale->Shape().Size());
+    if (kv_cache_is_fp8_ || native_int8) {
+      for (int64_t i = 0; i < expected_scale_size; ++i) {
+        ORT_RETURN_IF_NOT(std::isfinite(k_scale->Data<float>()[i]) && k_scale->Data<float>()[i] > 0 &&
+                              std::isfinite(v_scale->Data<float>()[i]) && v_scale->Data<float>()[i] > 0,
+                          native_int8 ? "Native INT8 KV scales must be finite and positive"
+                                      : "FP8 KV scales must be finite and positive");
+      }
+    }
   }
 
   // Validate seqlens_k values before they are used as GEMM dimensions to prevent OOB access.
@@ -624,7 +642,7 @@ Status GroupQueryAttention<T>::Compute(OpKernelContext* context) const {
     if (kv_quant_enabled_) {
       const T* k_data_q = packed_qkv ? nullptr : k_rotary;
       const T* v_data_q = packed_qkv ? nullptr : V.Get<Tensor>().Data<T>();
-      auto mlas_quant_type = ToMlasKVQuantType(k_quant_type_, kv_cache_bit_width_);
+      const auto mlas_quant_type = mlas_kv_quant_type_;
 
       // Use flash attention path when:
       // 1. Total sequence length is long enough to benefit from tiling

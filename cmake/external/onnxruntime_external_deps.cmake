@@ -1034,7 +1034,12 @@ if(onnxruntime_USE_KLEIDIAI)
   # Disable the KleidiAI tests
   set(KLEIDIAI_BUILD_TESTS  OFF)
 
-  onnxruntime_fetchcontent_declare(kleidiai URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai} EXCLUDE_FROM_ALL)
+  onnxruntime_fetchcontent_declare(
+    kleidiai
+    URL ${DEP_URL_kleidiai} URL_HASH SHA1=${DEP_SHA1_kleidiai}
+    PATCH_COMMAND ${Patch_EXECUTABLE} --binary --ignore-whitespace -p1 <
+                  ${PROJECT_SOURCE_DIR}/patches/kleidiai/msvc_assembly.patch
+    EXCLUDE_FROM_ALL)
   onnxruntime_fetchcontent_makeavailable(kleidiai)
   # Fetch Qualcomm's kleidiai library
   if(onnxruntime_USE_QMX_KLEIDIAI_COEXIST)
