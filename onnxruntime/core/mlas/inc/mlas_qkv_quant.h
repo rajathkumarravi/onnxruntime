@@ -219,6 +219,10 @@ MlasKVDequantize(
  *   - Scales follow the conventions described for MlasKVQuantize, applied
  *     along the K (head_size) axis when PER_CHANNEL.
  *
+ * The AVX2 INT8 multi-query path reuses bounded FP32 key tiles with SGEMM.
+ * It dequantizes at most 128 cache rows at a time; single-query decode keeps
+ * the fused dequantize-dot path. The persistent cache format is unchanged.
+ *
  * @param M          Query token count for this (batch, head) tile.
  * @param N          Total sequence length of the K cache.
  * @param K          head_size.
@@ -253,9 +257,10 @@ MlasQKGemm(
  * @brief FP16-query variant of MlasQKGemm.
  *
  * The FP16 query is consumed directly while scores continue to accumulate in
- * FP32 for softmax. SIMD backends consume query vectors directly and
- * dequantize the KV cache on the fly; unsupported platforms use the scalar
- * fallback without materializing an FP32 query buffer.
+ * FP32 for softmax. SIMD decode consumes query vectors directly. The AVX2
+ * multi-query path converts its query tile once and reuses bounded FP32 key
+ * tiles with SGEMM. Unsupported platforms use the scalar fallback without
+ * materializing an FP32 query buffer.
  */
 void
 MLASCALL
@@ -288,6 +293,10 @@ MlasQKGemmFp16(
  *   - C is FP32 row-major, shape [M, N], stride ldc (>= N).
  *     When Beta == 0, C is overwritten. When Beta != 0, C is accumulated.
  *   - PER_CHANNEL scales are length N and apply along the N (head_size) axis.
+ *
+ * The AVX2 INT8 multi-query path reuses bounded FP32 value tiles with SGEMM.
+ * Beta applies once to the original C, not once per cache tile. Single-query
+ * decode and the INT4 paths retain their fused dequantization kernels.
  *
  * @param M          Query token count.
  * @param N          head_size.

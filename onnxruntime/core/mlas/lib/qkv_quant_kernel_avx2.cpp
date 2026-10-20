@@ -16,17 +16,31 @@ Abstract:
 
 --*/
 
-#include "qkv_quant_kernel.h"
-#include "qkv_quant_common.h"
-#include "mlas_qkv_quant.h"
-
-#include <cstring>
 #include <immintrin.h>
+
+#include <algorithm>
+#include <cstring>
 #include <memory>
+
+#include "core/common/safeint.h"
+#include "mlas_qkv_quant.h"
+#include "qkv_quant_common.h"
+#include "qkv_quant_kernel.h"
 
 using namespace MlasKVQuantInternal;
 
 namespace {
+
+constexpr size_t kInt8PrefillMinimumRows = 16;
+constexpr size_t kInt8DequantTileRows = 128;
+
+bool
+UseInt8PrefillGemm(size_t M, MLAS_KV_QUANT_TYPE QuantType)
+{
+    return M >= kInt8PrefillMinimumRows &&
+           (QuantType == MLAS_KV_QUANT_TYPE::S8_PerTensor ||
+            QuantType == MLAS_KV_QUANT_TYPE::S8_PerChannel);
+}
 
 //
 // Dequantize 8 INT4 values (4 packed bytes) starting at even column `col`.
@@ -250,9 +264,8 @@ FusedDotInt4(
 // QKGemm:  C[M,N] = Alpha * A[M,K] * B^T[K,N]
 // B is [N,K] packed row-major.
 //
-// Fused approach: dequantize B directly into FMA accumulators without
-// intermediate buffer. For M>1, B row is re-dequantized per query row
-// (still faster due to no store/reload and B being in L1 cache).
+// Small query blocks dequantize B directly into FMA accumulators. Larger INT8
+// blocks amortize dequantization across query rows with bounded SGEMM tiles.
 //
 void
 QKGemm_Avx2(
@@ -268,6 +281,20 @@ QKGemm_Avx2(
     float* C,
     size_t ldc)
 {
+    // Reuse each dequantized key tile across query rows instead of unpacking
+    // the same INT8 row for every dot product. Decode keeps the fused path.
+    if (N != 0 && K != 0 && UseInt8PrefillGemm(M, QuantType)) {
+        const size_t tile_rows = std::min(N, kInt8DequantTileRows);
+        auto dequantized = std::make_unique<float[]>(SafeInt<size_t>(tile_rows) * K);
+        const auto* keys = static_cast<const int8_t*>(B);
+        for (size_t offset = 0; offset < N; offset += tile_rows) {
+            const size_t count = std::min(tile_rows, N - offset);
+            MlasKVDequantize(keys + offset * K, dequantized.get(), count, K, K, QuantType, Scales, nullptr);
+            MlasGemm(CblasNoTrans, CblasTrans, M, count, K, Alpha, A, lda, dequantized.get(), K, 0.0f, C + offset, ldc, nullptr, nullptr);
+        }
+        return;
+    }
+
     const size_t row_bytes = MlasKVQuantPackedRowBytes(QuantType, K);
     const auto* B_bytes = static_cast<const uint8_t*>(B);
     const bool int4 = IsInt4Mode(QuantType);
@@ -335,6 +362,10 @@ QKGemmFp16_Avx2(
     for (size_t m = 0; m < M; ++m) {
         MlasConvertHalfToFloatBuffer(A + m * lda, a_buf + m * K, K);
     }
+    if (UseInt8PrefillGemm(M, QuantType)) {
+        QKGemm_Avx2(M, N, K, Alpha, a_buf, K, B, QuantType, Scales, C, ldc);
+        return;
+    }
     for (size_t n = 0; n < N; ++n) {
         const uint8_t* b_row = B_bytes + n * row_bytes;
         for (size_t m = 0; m < M; ++m) {
@@ -352,8 +383,8 @@ QKGemmFp16_Avx2(
 // SVGemm:  C[M,N] = Beta * C[M,N] + A[M,K] * B[K,N]
 // B is [K,N] packed row-major.
 //
-// Fused approach: dequantize each B[k,:] element directly into the FMA with
-// the C accumulator, eliminating the intermediate buffer entirely.
+// Small query blocks retain fused dequantization; larger INT8 blocks reuse
+// a bounded dequantized V tile across query rows.
 //
 void
 SVGemm_Avx2(
@@ -369,6 +400,18 @@ SVGemm_Avx2(
     size_t ldc,
     float Beta)
 {
+    if (K != 0 && N != 0 && UseInt8PrefillGemm(M, QuantType)) {
+        const size_t tile_rows = std::min(K, kInt8DequantTileRows);
+        auto dequantized = std::make_unique<float[]>(SafeInt<size_t>(tile_rows) * N);
+        const auto* values = static_cast<const int8_t*>(B);
+        for (size_t offset = 0; offset < K; offset += tile_rows) {
+            const size_t count = std::min(tile_rows, K - offset);
+            MlasKVDequantize(values + offset * N, dequantized.get(), count, N, N, QuantType, Scales, nullptr);
+            MlasGemm(CblasNoTrans, CblasNoTrans, M, N, count, 1.0f, A + offset, lda, dequantized.get(), N, offset == 0 ? Beta : 1.0f, C, ldc, nullptr, nullptr);
+        }
+        return;
+    }
+
     const size_t row_bytes = MlasKVQuantPackedRowBytes(QuantType, N);
     const auto* B_bytes = static_cast<const uint8_t*>(B);
     const bool int4 = IsInt4Mode(QuantType);

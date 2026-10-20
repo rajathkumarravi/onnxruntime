@@ -352,6 +352,90 @@ class MlasKVQuantTest : public MlasTestBase {
     }
   }
 
+  void TestInt8PrefillStrides(size_t M, size_t SequenceLength, size_t HeadSize,
+                              MLAS_KV_QUANT_TYPE QuantType) {
+    const size_t query_stride = HeadSize + 5;
+    const size_t score_stride = SequenceLength + 7;
+    const size_t output_stride = HeadSize + 7;
+    constexpr float sentinel = -1234.0f;
+    constexpr float alpha = 0.125f;
+    std::vector<float> query(M * query_stride);
+    std::vector<float> rounded_query(query.size());
+    std::vector<MLAS_FP16> half_query(query.size());
+    std::vector<float> values(SequenceLength * HeadSize);
+    std::vector<float> scales(IsPerChannel(QuantType) ? HeadSize : 1);
+    std::vector<uint8_t> quantized(values.size());
+    std::vector<float> dequantized(values.size());
+    FillRandom(query.data(), query.size(), 107, -0.5f, 0.5f);
+    FillRandom(values.data(), values.size(), 109);
+    for (size_t i = 0; i < query.size(); ++i) {
+      half_query[i] = MLAS_FP16(query[i]);
+      rounded_query[i] = static_cast<float>(half_query[i]);
+    }
+    ComputeScales(values.data(), SequenceLength, HeadSize, QuantType, scales.data());
+    MlasKVQuantize(values.data(), quantized.data(), SequenceLength, HeadSize, HeadSize,
+                   QuantType, scales.data(), nullptr);
+    MlasKVDequantize(quantized.data(), dequantized.data(), SequenceLength, HeadSize, HeadSize,
+                     QuantType, scales.data(), nullptr);
+    const auto original_quantized = quantized;
+
+    for (bool half : {false, true}) {
+      std::vector<float> actual(M * score_stride, sentinel);
+      std::vector<float> expected(M * score_stride, sentinel);
+      RefQKGemm(half ? rounded_query.data() : query.data(), dequantized.data(), expected.data(),
+                M, SequenceLength, HeadSize, alpha, query_stride, score_stride);
+      if (half) {
+        MlasQKGemmFp16(M, SequenceLength, HeadSize, alpha, half_query.data(), query_stride,
+                       quantized.data(), QuantType, scales.data(), actual.data(), score_stride, nullptr);
+      } else {
+        MlasQKGemm(M, SequenceLength, HeadSize, alpha, query.data(), query_stride,
+                   quantized.data(), QuantType, scales.data(), actual.data(), score_stride, nullptr);
+      }
+      for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < score_stride; ++n) {
+          if (n < SequenceLength) {
+            ASSERT_NEAR(actual[m * score_stride + n], expected[m * score_stride + n], 1e-3f);
+          } else {
+            ASSERT_EQ(actual[m * score_stride + n], sentinel);
+          }
+        }
+      }
+    }
+
+    std::vector<float> probabilities(M * score_stride);
+    FillRandom(probabilities.data(), probabilities.size(), 113, 0.0f, 1.0f);
+    for (size_t m = 0; m < M; ++m) {
+      for (size_t n = 0; n < SequenceLength; ++n) {
+        probabilities[m * score_stride + n] /= static_cast<float>(SequenceLength);
+      }
+    }
+    for (float beta : {0.0f, 0.5f, 1.0f}) {
+      std::vector<float> actual(M * output_stride, sentinel);
+      std::vector<float> expected(M * output_stride, sentinel);
+      for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < HeadSize; ++n) {
+          actual[m * output_stride + n] = static_cast<float>(int(n % 7) - 3) * 0.125f;
+        }
+      }
+      const auto initial = actual;
+      RefSVGemm(probabilities.data(), dequantized.data(), expected.data(),
+                M, HeadSize, SequenceLength, score_stride, output_stride);
+      MlasSVGemm(M, HeadSize, SequenceLength, probabilities.data(), score_stride, quantized.data(),
+                 QuantType, scales.data(), actual.data(), output_stride, beta, nullptr);
+      for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < output_stride; ++n) {
+          if (n < HeadSize) {
+            const size_t index = m * output_stride + n;
+            ASSERT_NEAR(actual[index], expected[index] + beta * initial[index], 1e-3f);
+          } else {
+            ASSERT_EQ(actual[m * output_stride + n], sentinel);
+          }
+        }
+      }
+    }
+    ASSERT_EQ(quantized, original_quantized);
+  }
+
  public:
   static const char* GetTestSuiteName() {
     static const std::string suite_name("KVQuant");
@@ -401,6 +485,12 @@ class MlasKVQuantTest : public MlasTestBase {
 
     for (auto qt : AllQuantTypes) {
       TestFp16Apis(qt);
+    }
+    for (auto qt : {MLAS_KV_QUANT_TYPE::S8_PerTensor, MLAS_KV_QUANT_TYPE::S8_PerChannel}) {
+      TestInt8PrefillStrides(15, 129, 19, qt);
+      TestInt8PrefillStrides(16, 128, 128, qt);
+      TestInt8PrefillStrides(17, 129, 19, qt);
+      TestInt8PrefillStrides(128, 257, 128, qt);
     }
   }
 };
