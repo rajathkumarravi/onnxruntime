@@ -50,8 +50,14 @@ MlasFlashAttentionQuantizedKVThreaded(
     const ptrdiff_t local_window_size = static_cast<ptrdiff_t>(args->local_window_size);
     const float scale = args->scale;
     const MLAS_KV_QUANT_TYPE quant_type = args->quant_type;
+    const bool native_int4 = MlasKVQuantInternal::UsesNativeInt4Gemm(quant_type);
+    MlasKVQuantInternal::NativeInt4Workspace int4_workspace;
     const bool native_int8 = MlasKVQuantInternal::UsesNativeInt8Gemm(quant_type);
     MlasKVQuantInternal::NativeInt8Workspace int8_workspace;
+    const bool fp8_half = MlasKVQuantInternal::UsesFp8HalfGemm(quant_type);
+    MlasKVQuantInternal::Fp8HalfWorkspace fp8_workspace;
+    const bool decoded_gemm = MlasKVQuantInternal::UsesDecodedGemm(quant_type);
+    MlasKVQuantInternal::DecodedGemmWorkspace decoded_workspace;
 
     float* buffer = args->buffer;
     const ptrdiff_t buffer_size_per_thread = static_cast<ptrdiff_t>(args->buffer_size_per_thread);
@@ -138,6 +144,18 @@ MlasFlashAttentionQuantizedKVThreaded(
             static_cast<size_t>(head_idx) * static_cast<size_t>(sequence_length) * static_cast<size_t>(head_size) +
             static_cast<size_t>(q_idx) * static_cast<size_t>(head_size);
 
+        if (native_int4) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareNativeInt4Query(
+                    row_size_q, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int4_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareNativeInt4Query(
+                    row_size_q, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int4_workspace);
+            }
+        }
+
         if (native_int8) {
             if (args->query_fp16 != nullptr) {
                 MlasKVQuantInternal::PrepareNativeInt8Query(
@@ -150,6 +168,30 @@ MlasFlashAttentionQuantizedKVThreaded(
             }
         }
 
+        if (fp8_half) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareFp8HalfQuery(
+                    row_size_q, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), fp8_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareFp8HalfQuery(
+                    row_size_q, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), fp8_workspace);
+            }
+        }
+
+        if (decoded_gemm) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareDecodedQuery(
+                    row_size_q, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), decoded_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareDecodedQuery(
+                    row_size_q, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), decoded_workspace);
+            }
+        }
+
         // Iterate over KV blocks
         for (ptrdiff_t ir = 0; ir < total_seqlen; ir += kv_block_size) {
             const size_t row_size_kv = static_cast<size_t>(std::min(kv_block_size, total_seqlen - ir));
@@ -158,10 +200,22 @@ MlasFlashAttentionQuantizedKVThreaded(
             // K cache at row offset ir: pointer arithmetic on packed rows
             const uint8_t* k_block = k_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
 
-            if (native_int8) {
+            if (native_int4) {
+                MlasKVQuantInternal::NativeInt4QKGemm(
+                    row_size_q, row_size_kv, static_cast<size_t>(head_size), scale, k_block,
+                    scores, row_size_kv, int4_workspace);
+            } else if (native_int8) {
                 MlasKVQuantInternal::NativeInt8QKGemm(
                     row_size_q, row_size_kv, static_cast<size_t>(head_size), scale, k_block,
                     scores, row_size_kv, int8_workspace);
+            } else if (fp8_half) {
+                MlasKVQuantInternal::Fp8HalfQKGemm(
+                    row_size_q, row_size_kv, static_cast<size_t>(head_size), scale, k_block, quant_type,
+                    head_k_scale, scores, row_size_kv, fp8_workspace);
+            } else if (decoded_gemm) {
+                MlasKVQuantInternal::DecodedQKGemm(
+                    row_size_q, row_size_kv, static_cast<size_t>(head_size), scale, k_block, quant_type,
+                    head_k_scale, scores, row_size_kv, decoded_workspace);
             } else if (args->query_fp16 != nullptr) {
                 MlasQKGemmFp16(
                     row_size_q, static_cast<size_t>(row_size_kv), static_cast<size_t>(head_size), scale,
@@ -275,11 +329,26 @@ MlasFlashAttentionQuantizedKVThreaded(
 
             // Step 4: Accumulate O += S_exp * V_block using fused dequant+GEMM
             const uint8_t* v_block = v_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
-            if (native_int8) {
+            if (native_int4) {
+                MlasKVQuantInternal::NativeInt4SVGemm(
+                    row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                    v_block, head_v_scale, temp_output, static_cast<size_t>(head_size),
+                    1.0f, int4_workspace);
+            } else if (native_int8) {
                 MlasKVQuantInternal::NativeInt8SVGemm(
                     row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
                     v_block, head_v_scale, temp_output, static_cast<size_t>(head_size),
                     1.0f, int8_workspace);
+            } else if (fp8_half) {
+                MlasKVQuantInternal::Fp8HalfSVGemm(
+                    row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                    v_block, quant_type, head_v_scale, temp_output, static_cast<size_t>(head_size),
+                    1.0f, fp8_workspace);
+            } else if (decoded_gemm) {
+                MlasKVQuantInternal::DecodedSVGemm(
+                    row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                    v_block, quant_type, head_v_scale, temp_output, static_cast<size_t>(head_size),
+                    1.0f, decoded_workspace);
             } else {
                 MlasSVGemm(
                     row_size_q, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
@@ -336,6 +405,12 @@ MlasFlashDecodingQuantizedKVThreaded(
     const ptrdiff_t local_window_size = static_cast<ptrdiff_t>(args->local_window_size);
     const float scale = args->scale;
     const MLAS_KV_QUANT_TYPE quant_type = args->quant_type;
+    const bool native_int4 = MlasKVQuantInternal::UsesNativeInt4Gemm(quant_type);
+    MlasKVQuantInternal::NativeInt4Workspace int4_workspace;
+    const bool fp8_half = MlasKVQuantInternal::UsesFp8HalfGemm(quant_type);
+    MlasKVQuantInternal::Fp8HalfWorkspace fp8_workspace;
+    const bool decoded_gemm = MlasKVQuantInternal::UsesDecodedGemm(quant_type);
+    MlasKVQuantInternal::DecodedGemmWorkspace decoded_workspace;
 
     float* buffer = args->buffer;
     const ptrdiff_t buffer_size_per_thread = static_cast<ptrdiff_t>(args->buffer_size_per_thread);
@@ -413,7 +488,46 @@ MlasFlashDecodingQuantizedKVThreaded(
 
         // Step 1: QK^T GEMM for this KV chunk
         const uint8_t* k_block = k_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
-        if (args->query_fp16 != nullptr) {
+        if (native_int4) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareNativeInt4Query(
+                    1, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int4_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareNativeInt4Query(
+                    1, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), head_k_scale, int4_workspace);
+            }
+            MlasKVQuantInternal::NativeInt4QKGemm(
+                1, row_size_kv, static_cast<size_t>(head_size), scale, k_block,
+                scores, row_size_kv, int4_workspace);
+        } else if (fp8_half) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareFp8HalfQuery(
+                    1, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), fp8_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareFp8HalfQuery(
+                    1, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), fp8_workspace);
+            }
+            MlasKVQuantInternal::Fp8HalfQKGemm(
+                1, row_size_kv, static_cast<size_t>(head_size), scale, k_block, quant_type,
+                head_k_scale, scores, row_size_kv, fp8_workspace);
+        } else if (decoded_gemm) {
+            if (args->query_fp16 != nullptr) {
+                MlasKVQuantInternal::PrepareDecodedQuery(
+                    1, static_cast<size_t>(head_size), args->query_fp16 + q_offset,
+                    static_cast<size_t>(head_size), decoded_workspace);
+            } else {
+                MlasKVQuantInternal::PrepareDecodedQuery(
+                    1, static_cast<size_t>(head_size), args->query + q_offset,
+                    static_cast<size_t>(head_size), decoded_workspace);
+            }
+            MlasKVQuantInternal::DecodedQKGemm(
+                1, row_size_kv, static_cast<size_t>(head_size), scale, k_block, quant_type,
+                head_k_scale, scores, row_size_kv, decoded_workspace);
+        } else if (args->query_fp16 != nullptr) {
             MlasQKGemmFp16(
                 1, row_size_kv, static_cast<size_t>(head_size), scale,
                 args->query_fp16 + q_offset, static_cast<size_t>(head_size), k_block, quant_type,
@@ -509,6 +623,27 @@ MlasFlashDecodingQuantizedKVThreaded(
         // Step 4: S_exp * V_block -> partial_output
         const uint8_t* v_block = v_cache_head + static_cast<size_t>(ir) * packed_row_bytes;
         memset(partial_output, 0, static_cast<size_t>(head_size) * sizeof(float));
+        if (native_int4) {
+            MlasKVQuantInternal::NativeInt4SVGemm(
+                1, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                v_block, head_v_scale, partial_output, static_cast<size_t>(head_size),
+                0.0f, int4_workspace);
+            continue;
+        }
+        if (fp8_half) {
+            MlasKVQuantInternal::Fp8HalfSVGemm(
+                1, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                v_block, quant_type, head_v_scale, partial_output, static_cast<size_t>(head_size),
+                0.0f, fp8_workspace);
+            continue;
+        }
+        if (decoded_gemm) {
+            MlasKVQuantInternal::DecodedSVGemm(
+                1, static_cast<size_t>(head_size), row_size_kv, scores, row_size_kv,
+                v_block, quant_type, head_v_scale, partial_output, static_cast<size_t>(head_size),
+                0.0f, decoded_workspace);
+            continue;
+        }
         MlasSVGemm(
             1,                                  // M
             static_cast<size_t>(head_size),     // N

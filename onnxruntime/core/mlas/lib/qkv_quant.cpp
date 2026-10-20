@@ -34,6 +34,9 @@ Abstract:
 #include "mlas_qkv_quant.h"
 #include "mlasi.h"
 #include "qkv_quant_common.h"
+#include "mlas_qnbit.h"
+
+#include <memory>
 #include "qkv_quant_kernel.h"
 
 using namespace MlasKVQuantInternal;
@@ -72,14 +75,83 @@ SafeInvScale(float scale)
     return (scale != 0.0f) ? (1.0f / scale) : 1.0f;
 }
 
+#if defined(MLAS_TARGET_ARM64) && !defined(DISABLE_FLOAT8_TYPES)
+template <bool E5M2>
+uint32x4_t QuantizeFp8x4(float32x4_t values)
+{
+    constexpr int shift = E5M2 ? 21 : 20;
+    constexpr uint32_t minimum_normal = E5M2 ? 0x38800000U : 0x3c800000U;
+    constexpr uint32_t bias = E5M2 ? 112U * 4 : 120U * 8;
+    const uint32x4_t bits = vreinterpretq_u32_f32(values);
+    const uint32x4_t magnitude = vandq_u32(bits, vdupq_n_u32(0x7fffffff));
+    const uint32x4_t odd = vandq_u32(vshrq_n_u32(magnitude, shift), vdupq_n_u32(1));
+    const uint32x4_t rounded = vaddq_u32(magnitude, vaddq_u32(vdupq_n_u32((1U << (shift - 1)) - 1), odd));
+    const uint32x4_t normal = vminq_u32(
+        vsubq_u32(vshrq_n_u32(rounded, shift), vdupq_n_u32(bias)), vdupq_n_u32(E5M2 ? 0x7b : 0x7e));
+    const uint32x4_t small = vcltq_u32(magnitude, vdupq_n_u32(minimum_normal));
+    // Mask before conversion so NaN/Inf and large normal values cannot overflow the subnormal calculation.
+    const float32x4_t subnormal = vreinterpretq_f32_u32(vandq_u32(magnitude, small));
+    const uint32x4_t subnormal_bits = vcvtnq_u32_f32(vmulq_n_f32(subnormal, E5M2 ? 65536.0f : 512.0f));
+    uint32x4_t encoded = vbslq_u32(small, subnormal_bits, normal);
+    encoded = vbslq_u32(vcgtq_u32(magnitude, vdupq_n_u32(0x7f800000)), vdupq_n_u32(0x7f), encoded);
+    return vorrq_u32(encoded, vshrq_n_u32(vandq_u32(bits, vdupq_n_u32(0x80000000)), 24));
+}
+
+float32x4_t Fp8InverseScales(const float* scales)
+{
+    const float32x4_t values = vld1q_f32(scales);
+    const float32x4_t nonzero = vbslq_f32(vceqq_f32(values, vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f), values);
+    return vdivq_f32(vdupq_n_f32(1.0f), nonzero);
+}
+
+float16x8_t DecodeFp8x8(const uint8_t* source, bool e4m3)
+{
+    const uint8x8_t bytes = vld1_u8(source);
+    const uint16x8_t magnitude = vmovl_u8(vand_u8(bytes, vdup_n_u8(0x7f)));
+    uint16x8_t bits;
+    if (e4m3) {
+        static constexpr uint8_t subnormal_high_bytes[8] = {0, 0x18, 0x1c, 0x1e, 0x20, 0x21, 0x22, 0x23};
+        const uint8x8_t small = vtbl1_u8(vld1_u8(subnormal_high_bytes), vand_u8(bytes, vdup_n_u8(7)));
+        bits = vbslq_u16(
+            vcltq_u16(magnitude, vdupq_n_u16(8)), vshll_n_u8(small, 8),
+            vaddq_u16(vshlq_n_u16(magnitude, 7), vdupq_n_u16(0x2000)));
+        bits = vbslq_u16(vceqq_u16(magnitude, vdupq_n_u16(0x7f)), vdupq_n_u16(0x7e00), bits);
+    } else {
+        bits = vshlq_n_u16(magnitude, 8);
+        bits = vbslq_u16(vcgtq_u16(magnitude, vdupq_n_u16(0x7c)), vdupq_n_u16(0x7e00), bits);
+    }
+    return vreinterpretq_f16_u16(vorrq_u16(bits, vshll_n_u8(vand_u8(bytes, vdup_n_u8(0x80)), 8)));
+}
+#endif
+
 template <typename T>
 void
 QuantizeRowFp8(const T* src, uint8_t* dst, size_t cols, MLAS_KV_QUANT_TYPE type, const float* scales)
 {
 #if !defined(DISABLE_FLOAT8_TYPES)
-    for (size_t c = 0; c < cols; ++c) {
+    const bool e4m3 = IsFp8E4M3Mode(type);
+    size_t c = 0;
+#if defined(MLAS_TARGET_ARM64)
+    for (; c + 8 <= cols; c += 8) {
+        float32x4_t low, high;
+        if constexpr (std::is_same_v<T, float>) {
+            low = vld1q_f32(src + c);
+            high = vld1q_f32(src + c + 4);
+        } else {
+            const float16x8_t half = vreinterpretq_f16_u16(vld1q_u16(reinterpret_cast<const uint16_t*>(src + c)));
+            low = vcvt_f32_f16(vget_low_f16(half));
+            high = vcvt_f32_f16(vget_high_f16(half));
+        }
+        low = vmulq_f32(low, Fp8InverseScales(scales + c));
+        high = vmulq_f32(high, Fp8InverseScales(scales + c + 4));
+        const uint32x4_t low_bits = e4m3 ? QuantizeFp8x4<false>(low) : QuantizeFp8x4<true>(low);
+        const uint32x4_t high_bits = e4m3 ? QuantizeFp8x4<false>(high) : QuantizeFp8x4<true>(high);
+        vst1_u8(dst + c, vmovn_u16(vcombine_u16(vmovn_u32(low_bits), vmovn_u32(high_bits))));
+    }
+#endif
+    for (; c < cols; ++c) {
         const float value = static_cast<float>(src[c]) * SafeInvScale(scales[c]);
-        dst[c] = type == MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel
+        dst[c] = e4m3
                      ? onnxruntime::Float8E4M3FN(value, true).val
                      : onnxruntime::Float8E5M2(value, true).val;
     }
@@ -117,19 +189,38 @@ Fp8Lookup(MLAS_KV_QUANT_TYPE type)
         }
         return values;
     }();
-    return type == MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel ? e4m3 : e5m2;
+    return IsFp8E4M3Mode(type) ? e4m3 : e5m2;
 #else
     ORT_UNUSED_PARAMETER(type);
     ORT_THROW("FP8 KV support is disabled in this build");
 #endif
 }
 
+template <typename T>
 void
-DequantizeRowFp8(const uint8_t* src, float* dst, size_t cols, MLAS_KV_QUANT_TYPE type, const float* scales)
+DequantizeRowFp8(const uint8_t* src, T* dst, size_t cols, MLAS_KV_QUANT_TYPE type, const float* scales)
 {
+    size_t c = 0;
+#if defined(MLAS_TARGET_ARM64) && !defined(DISABLE_FLOAT8_TYPES)
+    for (; c + 8 <= cols; c += 8) {
+        const float16x8_t half = DecodeFp8x8(src + c, IsFp8E4M3Mode(type));
+        const float32x4_t low = vmulq_f32(vcvt_f32_f16(vget_low_f16(half)), vld1q_f32(scales + c));
+        const float32x4_t high = vmulq_f32(vcvt_f32_f16(vget_high_f16(half)), vld1q_f32(scales + c + 4));
+        if constexpr (std::is_same_v<T, float>) {
+            vst1q_f32(dst + c, low);
+            vst1q_f32(dst + c + 4, high);
+        } else {
+            const float16x8_t scaled = vcombine_f16(vcvt_f16_f32(low), vcvt_f16_f32(high));
+            vst1q_u16(reinterpret_cast<uint16_t*>(dst + c), vreinterpretq_u16_f16(scaled));
+        }
+    }
+    if (c == cols) {
+        return;
+    }
+#endif
     const auto& values = Fp8Lookup(type);
-    for (size_t c = 0; c < cols; ++c) {
-        dst[c] = values[src[c]] * scales[c];
+    for (; c < cols; ++c) {
+        dst[c] = T(values[src[c]] * scales[c]);
     }
 }
 
@@ -301,15 +392,20 @@ T* WorkspaceBuffer(std::vector<T>& buffer, size_t count)
     return buffer.data();
 }
 
+void ValidateKVScales(const float* scales, size_t count, const char* name)
+{
+    ORT_ENFORCE(scales != nullptr, name, " scales are required");
+    for (size_t i = 0; i < count; ++i) {
+        ORT_ENFORCE(std::isfinite(scales[i]) && scales[i] > 0.0f,
+                    name, " scales must be finite and positive");
+    }
+}
+
 void ValidateNativeInt8Scales(const float* scales, size_t count)
 {
     ORT_ENFORCE(MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native),
                 "Native INT8 KV attention requires ARM64 integer GEMM support");
-    ORT_ENFORCE(scales != nullptr, "Native INT8 KV scales are required");
-    for (size_t i = 0; i < count; ++i) {
-        ORT_ENFORCE(std::isfinite(scales[i]) && scales[i] > 0.0f,
-                    "Native INT8 KV scales must be finite and positive");
-    }
+    ValidateKVScales(scales, count, "Native INT8 KV");
 }
 
 float NativeInt8Scale(float peak, float limit)
@@ -318,7 +414,7 @@ float NativeInt8Scale(float peak, float limit)
     return peak == 0.0f ? 1.0f : std::max(peak / limit, std::numeric_limits<float>::min());
 }
 
-bool NativeInt8FindFiniteRange(const float* input, size_t count, float& minimum, float& maximum)
+bool FindFiniteRange(const float* input, size_t count, float& minimum, float& maximum)
 {
     minimum = std::numeric_limits<float>::max();
     maximum = std::numeric_limits<float>::lowest();
@@ -350,6 +446,25 @@ bool NativeInt8FindFiniteRange(const float* input, size_t count, float& minimum,
 }
 
 template <typename T>
+void PrepareScaledQueryRow(const T* input, size_t count, const float* scales, float* row)
+{
+    if constexpr (std::is_same_v<T, float>) {
+        std::copy_n(input, count, row);
+    } else {
+        MlasConvertHalfToFloatBuffer(input, row, count);
+    }
+    size_t k = 0;
+#if defined(MLAS_TARGET_ARM64)
+    for (; k + 4 <= count; k += 4) {
+        vst1q_f32(row + k, vmulq_f32(vld1q_f32(row + k), vld1q_f32(scales + k)));
+    }
+#endif
+    for (; k < count; ++k) {
+        row[k] *= scales[k];
+    }
+}
+
+template <typename T>
 void PrepareNativeInt8QueryImpl(
     size_t M, size_t K, const T* A, size_t lda, const float* scales, NativeInt8Workspace& workspace)
 {
@@ -362,29 +477,185 @@ void PrepareNativeInt8QueryImpl(
     auto* row_scales = WorkspaceBuffer(workspace.query_scales, M);
     auto* row = WorkspaceBuffer(workspace.float_row, K);
     for (size_t m = 0; m < M; ++m) {
-        if constexpr (std::is_same_v<T, float>) {
-            std::copy_n(A + m * lda, K, row);
-        } else {
-            MlasConvertHalfToFloatBuffer(A + m * lda, row, K);
-        }
         // Fold per-channel K scaling into Q before its per-row quantization.
-        size_t k = 0;
-#if defined(MLAS_TARGET_ARM64)
-        for (; k + 4 <= K; k += 4) {
-            vst1q_f32(row + k, vmulq_f32(vld1q_f32(row + k), vld1q_f32(scales + k)));
-        }
-#endif
-        for (; k < K; ++k) {
-            row[k] *= scales[k];
-        }
+        PrepareScaledQueryRow(A + m * lda, K, scales, row);
         float minimum, maximum;
-        ORT_ENFORCE(NativeInt8FindFiniteRange(row, K, minimum, maximum),
+        ORT_ENFORCE(FindFiniteRange(row, K, minimum, maximum),
                     "Native INT8 attention requires finite scaled queries");
         row_scales[m] = NativeInt8Scale(std::max(std::abs(minimum), std::abs(maximum)), 127.0f);
         MlasQuantizeLinear(row, query + m * K, K, row_scales[m], int8_t{0});
     }
     workspace.query_rows = M;
     workspace.query_columns = K;
+}
+
+constexpr size_t NativeInt4BlockSize = 128;
+
+size_t NativeInt4Blocks(size_t count)
+{
+    return count / NativeInt4BlockSize + (count % NativeInt4BlockSize != 0);
+}
+
+bool NativeInt4UseInt8(size_t reduction)
+{
+    return MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native) &&
+           reduction <= static_cast<size_t>(std::numeric_limits<int32_t>::max()) / (255 * 128);
+}
+
+void UnpackNativeInt4Rows(size_t rows, size_t columns, const void* source, int8_t* target)
+{
+    const size_t stride = columns / 2 + columns % 2;
+    for (size_t row = 0; row < rows; ++row) {
+        const auto* input = static_cast<const uint8_t*>(source) + row * stride;
+        auto* output = target + row * columns;
+        size_t col = 0;
+#if defined(MLAS_TARGET_ARM64)
+        for (; col + 16 <= columns; col += 16) {
+            const uint8x8_t packed = vld1_u8(input + col / 2);
+            const uint8x8x2_t pairs = vzip_u8(vand_u8(packed, vdup_n_u8(0x0f)), vshr_n_u8(packed, 4));
+            const int8x16_t values = vreinterpretq_s8_u8(vcombine_u8(pairs.val[0], pairs.val[1]));
+            vst1q_s8(output + col, vsubq_s8(values, vdupq_n_s8(8)));
+        }
+#endif
+        for (; col < columns; ++col) {
+            output[col] = static_cast<int8_t>(static_cast<int>((input[col / 2] >> ((col % 2) * 4)) & 0x0f) - 8);
+        }
+    }
+}
+
+void* AlignedWorkspaceBuffer(std::vector<uint8_t>& storage, size_t bytes)
+{
+    if (bytes == 0) {
+        return nullptr;
+    }
+    const size_t alignment = MlasGetPreferredBufferAlignment();
+    void* result = WorkspaceBuffer(storage, SafeInt<size_t>(bytes) + alignment - 1);
+    size_t space = storage.size();
+    ORT_ENFORCE(std::align(alignment, bytes, result, space) != nullptr, "Cannot align native INT4 scratch");
+    return result;
+}
+
+template <typename T>
+void PrepareNativeInt4QueryImpl(
+    size_t M, size_t K, const T* A, size_t lda, const float* scales, NativeInt4Workspace& workspace)
+{
+    ORT_ENFORCE(MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native),
+                "Native INT4 KV attention requires integer GEMM support");
+    ValidateKVScales(scales, K, "Native INT4 KV");
+    ORT_ENFORCE(K > 0 && lda >= K, "Invalid native INT4 query dimensions or row stride");
+    workspace.query_rows = workspace.query_columns = 0;
+    if (NativeInt4UseInt8(K)) {
+        // Dynamic KV repacking is costly for weight kernels; reuse ARM64 integer attention.
+        PrepareNativeInt8QueryImpl(M, K, A, lda, scales, workspace.native_int8);
+        workspace.query_rows = M;
+        workspace.query_columns = K;
+        return;
+    }
+    auto* query = WorkspaceBuffer(workspace.query, SafeInt<size_t>(M) * K);
+    for (size_t m = 0; m < M; ++m) {
+        auto* row = query + m * K;
+        PrepareScaledQueryRow(A + m * lda, K, scales, row);
+        float minimum, maximum;
+        ORT_ENFORCE(FindFiniteRange(row, K, minimum, maximum),
+                    "Native INT4 attention requires finite scaled queries");
+    }
+    workspace.query_rows = M;
+    workspace.query_columns = K;
+}
+
+void PackNativeInt4Values(size_t K, size_t N, const uint8_t* source, uint8_t* target, size_t stride)
+{
+    const size_t source_stride = N / 2 + N % 2;
+    if (K % NativeInt4BlockSize != 0) {
+        const size_t bytes = SafeInt<size_t>(N) * stride;
+        std::fill_n(target, bytes, uint8_t{0x88});
+    }
+    const size_t pairs = K / 2;
+    size_t pair = 0;
+#if defined(MLAS_TARGET_ARM64)
+    const uint8x8_t low_mask = vdup_n_u8(0x0f);
+    const uint8x8_t high_mask = vdup_n_u8(0xf0);
+    alignas(16) uint8_t tile[8 * 16], transposed[8 * 16];
+    for (; pair + 8 <= pairs; pair += 8) {
+        size_t col = 0;
+        for (; col + 16 <= N; col += 16) {
+            for (size_t row = 0; row < 8; ++row) {
+                const auto* first = source + 2 * (pair + row) * source_stride + col / 2;
+                const uint8x8_t a = vld1_u8(first);
+                const uint8x8_t b = vld1_u8(first + source_stride);
+                const uint8x8_t even = vorr_u8(vand_u8(a, low_mask), vshl_n_u8(b, 4));
+                const uint8x8_t odd = vorr_u8(vshr_n_u8(a, 4), vand_u8(b, high_mask));
+                const uint8x8x2_t columns = vzip_u8(even, odd);
+                vst1q_u8(tile + row * 16, vcombine_u8(columns.val[0], columns.val[1]));
+            }
+            MlasTranspose(tile, transposed, 8, 16, nullptr);
+            for (size_t i = 0; i < 16; ++i) {
+                vst1_u8(target + (col + i) * stride + pair, vld1_u8(transposed + i * 8));
+            }
+        }
+        for (size_t row = 0; row < 8; ++row) {
+            for (size_t i = col; i < N; ++i) {
+                const size_t shift = (i % 2) * 4;
+                const auto a = source[2 * (pair + row) * source_stride + i / 2];
+                const auto b = source[(2 * (pair + row) + 1) * source_stride + i / 2];
+                target[i * stride + pair + row] = static_cast<uint8_t>(
+                    ((a >> shift) & 0x0f) | (((b >> shift) & 0x0f) << 4));
+            }
+        }
+    }
+#endif
+    for (; pair < pairs; ++pair) {
+        for (size_t col = 0; col < N; ++col) {
+            const size_t shift = (col % 2) * 4;
+            const auto a = source[2 * pair * source_stride + col / 2];
+            const auto b = source[(2 * pair + 1) * source_stride + col / 2];
+            target[col * stride + pair] = static_cast<uint8_t>(
+                ((a >> shift) & 0x0f) | (((b >> shift) & 0x0f) << 4));
+        }
+    }
+    if (K % 2 != 0) {
+        for (size_t col = 0; col < N; ++col) {
+            const auto last = source[(K - 1) * source_stride + col / 2];
+            target[col * stride + pairs] = static_cast<uint8_t>(((last >> ((col % 2) * 4)) & 0x0f) | 0x80);
+        }
+    }
+}
+
+void NativeInt4Product(
+    size_t M, size_t N, size_t K, const float* A, size_t lda, const void* B, const float* scales,
+    float* C, size_t ldc, NativeInt4Workspace& workspace, MLAS_THREADPOOL* thread_pool)
+{
+    constexpr auto compute = SQNBIT_CompInt8;
+    ORT_ENFORCE(MlasIsQNBitGemmAvailable(4, NativeInt4BlockSize, compute),
+                "This native INT4 reduction requires blocked integer GEMM support");
+    const size_t pack_size = MlasQNBitGemmPackQuantBDataSize(N, K, 4, NativeInt4BlockSize, false, compute, nullptr);
+    const void* packed = B;
+    if (pack_size != 0) {
+        auto* buffer = AlignedWorkspaceBuffer(workspace.packed, pack_size);
+        MlasQNBitGemmPackQuantBData(N, K, 4, NativeInt4BlockSize, compute, B, buffer,
+                                  scales, false, nullptr, thread_pool, nullptr);
+        bool finalize = MlasQNBitGemmScalesPacked(K, 4, NativeInt4BlockSize, compute, false, nullptr);
+#if defined(MLAS_TARGET_AMD64_IX86)
+        finalize = true;
+#endif
+        if (finalize) {
+            MlasQNBitGemmPackQuantBData(N, K, 4, NativeInt4BlockSize, compute, nullptr, buffer,
+                                      scales, false, nullptr, thread_pool, nullptr);
+        }
+        packed = buffer;
+    }
+    const size_t workspace_size =
+        MlasQNBitGemmBatchWorkspaceSize(M, N, K, 1, 4, NativeInt4BlockSize, false, compute, nullptr);
+    auto* scratch = AlignedWorkspaceBuffer(workspace.gemm_workspace, workspace_size);
+    MLAS_QNBIT_GEMM_DATA_PARAMS<float> data{};
+    data.A = A;
+    data.lda = lda;
+    data.QuantBDataWorkspace = packed;
+    data.PackedQuantBData = static_cast<const std::byte*>(packed);
+    data.QuantBScale = scales;
+    data.C = C;
+    data.ldc = ldc;
+    MlasQNBitGemmBatch(M, N, K, 1, 4, NativeInt4BlockSize, compute, &data, scratch, thread_pool, nullptr);
 }
 
 void NativeInt8Product(
@@ -410,6 +681,256 @@ void NativeInt8Product(
 }
 
 }  // namespace
+
+void PrepareNativeInt4Query(
+    size_t M, size_t K, const float* A, size_t lda, const float* Scales, NativeInt4Workspace& Workspace)
+{
+    PrepareNativeInt4QueryImpl(M, K, A, lda, Scales, Workspace);
+}
+
+void PrepareNativeInt4Query(
+    size_t M, size_t K, const MLAS_FP16* A, size_t lda, const float* Scales, NativeInt4Workspace& Workspace)
+{
+    PrepareNativeInt4QueryImpl(M, K, A, lda, Scales, Workspace);
+}
+
+void NativeInt4QKGemm(
+    size_t M, size_t N, size_t K, float Alpha, const void* B, float* C, size_t ldc,
+    NativeInt4Workspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(Workspace.query_rows == M && Workspace.query_columns == K && ldc >= N,
+                "Native INT4 query tile or output stride is invalid");
+    ORT_ENFORCE(std::isfinite(Alpha), "Native INT4 attention requires a finite QK scale");
+    if (Alpha == 0.0f || K == 0) {
+        for (size_t m = 0; m < M; ++m) std::fill_n(C + m * ldc, N, 0.0f);
+        return;
+    }
+    if (NativeInt4UseInt8(K)) {
+        auto* expanded = WorkspaceBuffer(Workspace.unpacked, SafeInt<size_t>(N) * K);
+        UnpackNativeInt4Rows(N, K, B, expanded);
+        NativeInt8QKGemm(M, N, K, Alpha, expanded, C, ldc, Workspace.native_int8, ThreadPool);
+        return;
+    }
+    const size_t blocks = NativeInt4Blocks(K);
+    const size_t stride = SafeInt<size_t>(blocks) * (NativeInt4BlockSize / 2);
+    const void* blocked = B;
+    if (K % NativeInt4BlockSize != 0) {
+        const size_t bytes = SafeInt<size_t>(N) * stride;
+        auto* buffer = WorkspaceBuffer(Workspace.blocked, bytes);
+        std::fill_n(buffer, bytes, uint8_t{0x88});
+        const size_t row_bytes = K / 2 + K % 2;
+        for (size_t n = 0; n < N; ++n) {
+            std::memcpy(buffer + n * stride, static_cast<const uint8_t*>(B) + n * row_bytes, row_bytes);
+            if (K % 2 != 0) {
+                buffer[n * stride + row_bytes - 1] = static_cast<uint8_t>(
+                    (buffer[n * stride + row_bytes - 1] & 0x0f) | 0x80);
+            }
+        }
+        blocked = buffer;
+    }
+    const size_t scale_count = SafeInt<size_t>(N) * blocks;
+    auto* scales = WorkspaceBuffer(Workspace.scales, scale_count);
+    std::fill_n(scales, scale_count, Alpha);
+    NativeInt4Product(M, N, K, Workspace.query.data(), K, blocked, scales, C, ldc, Workspace, ThreadPool);
+}
+
+void NativeInt4SVGemm(
+    size_t M, size_t N, size_t K, const float* A, size_t lda, const void* B, const float* Scales,
+    float* C, size_t ldc, float Beta, NativeInt4Workspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native),
+                "Native INT4 KV attention requires integer GEMM support");
+    ORT_ENFORCE(K > 0 && lda >= K && ldc >= N, "Invalid native INT4 probability or output row stride");
+    ValidateKVScales(Scales, N, "Native INT4 KV");
+    if (MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
+        auto* expanded = WorkspaceBuffer(Workspace.unpacked, SafeInt<size_t>(K) * N);
+        UnpackNativeInt4Rows(K, N, B, expanded);
+        // Short probability spans preserve weak attention beside a stronger local peak.
+        for (size_t offset = 0; offset < K; offset += 128) {
+            NativeInt8SVGemm(M, N, std::min(size_t{128}, K - offset), A + offset, lda,
+                            expanded + offset * N, Scales, C, ldc, offset == 0 ? Beta : 1.0f,
+                            Workspace.native_int8, ThreadPool);
+        }
+        return;
+    }
+    for (size_t m = 0; m < M; ++m) {
+        float minimum, maximum;
+        ORT_ENFORCE(FindFiniteRange(A + m * lda, K, minimum, maximum),
+                    "Native INT4 attention requires finite probabilities");
+    }
+    const size_t blocks = NativeInt4Blocks(K);
+    const size_t stride = SafeInt<size_t>(blocks) * (NativeInt4BlockSize / 2);
+    auto* blocked = WorkspaceBuffer(Workspace.blocked, SafeInt<size_t>(N) * stride);
+    PackNativeInt4Values(K, N, static_cast<const uint8_t*>(B), blocked, stride);
+    auto* scales = WorkspaceBuffer(Workspace.scales, SafeInt<size_t>(N) * blocks);
+    for (size_t n = 0; n < N; ++n) std::fill_n(scales + n * blocks, blocks, Scales[n]);
+    float* products = Beta == 0.0f ? C : WorkspaceBuffer(Workspace.products, SafeInt<size_t>(M) * N);
+    NativeInt4Product(M, N, K, A, lda, blocked, scales, products, Beta == 0.0f ? ldc : N, Workspace, ThreadPool);
+    if (Beta == 0.0f) {
+        return;
+    }
+    for (size_t m = 0; m < M; ++m) {
+        size_t n = 0;
+#if defined(MLAS_TARGET_ARM64)
+        for (; n + 4 <= N; n += 4) {
+            vst1q_f32(C + m * ldc + n, vaddq_f32(vld1q_f32(products + m * N + n),
+                                                vmulq_n_f32(vld1q_f32(C + m * ldc + n), Beta)));
+        }
+#endif
+        for (; n < N; ++n) C[m * ldc + n] = products[m * N + n] + Beta * C[m * ldc + n];
+    }
+}
+
+void PrepareDecodedQuery(
+    size_t M, size_t K, const float* A, size_t lda, DecodedGemmWorkspace& Workspace)
+{
+    ORT_ENFORCE(lda >= K, "Invalid decoded KV query row stride");
+    Workspace.prepared_query = A;
+    Workspace.query_stride = lda;
+    Workspace.query_rows = M;
+    Workspace.query_columns = K;
+}
+
+void PrepareDecodedQuery(
+    size_t M, size_t K, const MLAS_FP16* A, size_t lda, DecodedGemmWorkspace& Workspace)
+{
+    ORT_ENFORCE(lda >= K, "Invalid decoded KV query row stride");
+    auto* query = WorkspaceBuffer(Workspace.query, SafeInt<size_t>(M) * K);
+    for (size_t m = 0; m < M; ++m) {
+        MlasConvertHalfToFloatBuffer(A + m * lda, query + m * K, K);
+    }
+    PrepareDecodedQuery(M, K, query, K, Workspace);
+}
+
+void DecodedQKGemm(
+    size_t M, size_t N, size_t K, float Alpha, const void* B, MLAS_KV_QUANT_TYPE QuantType,
+    const float* Scales, float* C, size_t ldc, DecodedGemmWorkspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(UsesDecodedGemm(QuantType), "Decoded KV GEMM requires a decoded-compute cache mode");
+    ORT_ENFORCE(Workspace.query_rows == M && Workspace.query_columns == K && ldc >= N,
+                "Decoded KV query tile or output stride is invalid");
+    if (K == 0 || Alpha == 0.0f) {
+        for (size_t m = 0; m < M; ++m) {
+            std::fill_n(C + m * ldc, N, 0.0f);
+        }
+        return;
+    }
+    auto* decoded = WorkspaceBuffer(Workspace.decoded, SafeInt<size_t>(N) * K);
+    MlasKVDequantize(B, decoded, N, K, K, QuantType, Scales, nullptr);
+    MlasGemm(CblasNoTrans, CblasTrans, M, N, K, Alpha, Workspace.prepared_query, Workspace.query_stride,
+             decoded, K, 0.0f, C, ldc, ThreadPool, nullptr);
+}
+
+void DecodedSVGemm(
+    size_t M, size_t N, size_t K, const float* A, size_t lda, const void* B,
+    MLAS_KV_QUANT_TYPE QuantType, const float* Scales, float* C, size_t ldc, float Beta,
+    DecodedGemmWorkspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(UsesDecodedGemm(QuantType), "Decoded KV GEMM requires a decoded-compute cache mode");
+    ORT_ENFORCE(lda >= K && ldc >= N, "Invalid decoded KV probability or output row stride");
+    auto* decoded = WorkspaceBuffer(Workspace.decoded, SafeInt<size_t>(K) * N);
+    MlasKVDequantize(B, decoded, K, N, N, QuantType, Scales, nullptr);
+    MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, A, lda, decoded, N, Beta, C, ldc, ThreadPool, nullptr);
+}
+
+void PrepareFp8HalfQuery(
+    size_t M, size_t K, const float* A, size_t lda, Fp8HalfWorkspace& Workspace)
+{
+    ORT_ENFORCE(lda >= K, "Invalid FP8 query row stride");
+    auto* query = WorkspaceBuffer(Workspace.query, SafeInt<size_t>(M) * K);
+    for (size_t m = 0; m < M; ++m) {
+        MlasConvertFloatToHalfBuffer(A + m * lda, query + m * K, K);
+    }
+    PrepareFp8HalfQuery(M, K, query, K, Workspace);
+}
+
+void PrepareFp8HalfQuery(
+    size_t M, size_t K, const MLAS_FP16* A, size_t lda, Fp8HalfWorkspace& Workspace)
+{
+    ORT_ENFORCE(lda >= K, "Invalid FP8 query row stride");
+    Workspace.prepared_query = A;
+    Workspace.query_stride = lda;
+    Workspace.query_rows = M;
+    Workspace.query_columns = K;
+}
+
+void Fp8HalfQKGemm(
+    size_t M, size_t N, size_t K, float Alpha, const void* B, MLAS_KV_QUANT_TYPE QuantType,
+    const float* Scales, float* C, size_t ldc, Fp8HalfWorkspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(UsesFp8HalfGemm(QuantType) && MlasIsKVQuantGemmSupported(QuantType),
+                "FP8 FP16 compute requires accelerated half GEMMs");
+    ORT_ENFORCE(Workspace.query_rows == M && Workspace.query_columns == K && ldc >= N,
+                "FP8 FP16 query tile or output stride is invalid");
+    ValidateKVScales(Scales, K, "FP8 KV");
+    auto* decoded = WorkspaceBuffer(Workspace.decoded, SafeInt<size_t>(N) * K);
+    auto* products = WorkspaceBuffer(Workspace.products, SafeInt<size_t>(M) * N);
+    for (size_t n = 0; n < N; ++n) {
+        DequantizeRowFp8(static_cast<const uint8_t*>(B) + n * K, decoded + n * K, K, QuantType, Scales);
+    }
+    MlasGemm(CblasNoTrans, CblasTrans, M, N, K, Workspace.prepared_query, Workspace.query_stride,
+             decoded, K, products, N, MLAS_FP16(Alpha).val, uint16_t{0}, ThreadPool);
+    for (size_t m = 0; m < M; ++m) {
+        MlasConvertHalfToFloatBuffer(products + m * N, C + m * ldc, N);
+    }
+}
+
+void Fp8HalfSVGemm(
+    size_t M, size_t N, size_t K, const float* A, size_t lda, const void* B,
+    MLAS_KV_QUANT_TYPE QuantType, const float* Scales, float* C, size_t ldc, float Beta,
+    Fp8HalfWorkspace& Workspace, MLAS_THREADPOOL* ThreadPool)
+{
+    ORT_ENFORCE(UsesFp8HalfGemm(QuantType) && MlasIsKVQuantGemmSupported(QuantType),
+                "FP8 FP16 compute requires accelerated half GEMMs");
+    ORT_ENFORCE(lda >= K && ldc >= N, "Invalid FP8 probability or output row stride");
+    ValidateKVScales(Scales, N, "FP8 KV");
+    if (K == 0) {
+        for (size_t m = 0; m < M; ++m) {
+            for (size_t n = 0; n < N; ++n) {
+                C[m * ldc + n] = Beta == 0.0f ? 0.0f : Beta * C[m * ldc + n];
+            }
+        }
+        return;
+    }
+    auto* decoded = WorkspaceBuffer(Workspace.decoded, SafeInt<size_t>(K) * N);
+    auto* probabilities = WorkspaceBuffer(Workspace.probabilities, SafeInt<size_t>(M) * K);
+    auto* products = WorkspaceBuffer(Workspace.products, SafeInt<size_t>(M) * N);
+    for (size_t k = 0; k < K; ++k) {
+        DequantizeRowFp8(static_cast<const uint8_t*>(B) + k * N, decoded + k * N, N, QuantType, Scales);
+    }
+    for (size_t m = 0; m < M; ++m) {
+        MlasConvertFloatToHalfBuffer(A + m * lda, probabilities + m * K, K);
+    }
+    // Single-row HGEMM otherwise accumulates the entire KV tile in FP16.
+    for (size_t offset = 0; offset < K; offset += 128) {
+        const size_t count = std::min(size_t{128}, K - offset);
+        const float beta = offset == 0 ? Beta : 1.0f;
+        MlasGemm(CblasNoTrans, CblasNoTrans, M, N, count, probabilities + offset, K,
+                 decoded + offset * N, N, products, N, MLAS_FP16(1.0f).val, uint16_t{0}, ThreadPool);
+        for (size_t m = 0; m < M; ++m) {
+            if (beta == 0.0f) {
+                MlasConvertHalfToFloatBuffer(products + m * N, C + m * ldc, N);
+                continue;
+            }
+            size_t n = 0;
+#if defined(MLAS_TARGET_ARM64)
+            for (; n + 8 <= N; n += 8) {
+                const float16x8_t half = vreinterpretq_f16_u16(
+                    vld1q_u16(reinterpret_cast<const uint16_t*>(products + m * N + n)));
+                vst1q_f32(C + m * ldc + n,
+                          vaddq_f32(vcvt_f32_f16(vget_low_f16(half)),
+                                    vmulq_n_f32(vld1q_f32(C + m * ldc + n), beta)));
+                vst1q_f32(C + m * ldc + n + 4,
+                          vaddq_f32(vcvt_f32_f16(vget_high_f16(half)),
+                                    vmulq_n_f32(vld1q_f32(C + m * ldc + n + 4), beta)));
+            }
+#endif
+            for (; n < N; ++n) {
+                C[m * ldc + n] = beta * C[m * ldc + n] + static_cast<float>(products[m * N + n]);
+            }
+        }
+    }
+}
 
 void PrepareNativeInt8Query(
     size_t M, size_t K, const float* A, size_t lda, const float* Scales, NativeInt8Workspace& Workspace)
@@ -461,7 +982,7 @@ void NativeInt8SVGemm(
     for (size_t m = 0; m < M; ++m) {
         const float* row = A + m * lda;
         float minimum, maximum;
-        ORT_ENFORCE(NativeInt8FindFiniteRange(row, K, minimum, maximum),
+        ORT_ENFORCE(FindFiniteRange(row, K, minimum, maximum),
                     "Native INT8 attention requires finite probabilities");
         signed_a |= minimum < 0.0f;
         row_scales[m] = std::max(std::abs(minimum), std::abs(maximum));
@@ -502,6 +1023,10 @@ bool
     MLASCALL
     MlasIsKVQuantGemmSupported([[maybe_unused]] MLAS_KV_QUANT_TYPE QuantType)
 {
+    if (UsesNativeInt4Gemm(QuantType)) {
+        return MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native) ||
+               MlasIsQNBitGemmAvailable(4, NativeInt4BlockSize, SQNBIT_CompInt8);
+    }
     if (UsesNativeInt8Gemm(QuantType)) {
 #if defined(MLAS_TARGET_ARM64)
         return true;
@@ -514,6 +1039,10 @@ bool
         return false;
     }
 #endif
+    if (UsesFp8HalfGemm(QuantType)) {
+        return MlasHGemmSupported(CblasNoTrans, CblasTrans) &&
+               MlasHGemmSupported(CblasNoTrans, CblasNoTrans);
+    }
     // The portable reference path supports every mode on every platform.
     return true;
 }
@@ -665,6 +1194,12 @@ MlasQKGemm(
         return;
     }
 
+    if (UsesNativeInt4Gemm(QuantType)) {
+        NativeInt4Workspace workspace;
+        PrepareNativeInt4Query(M, K, A, lda, Scales, workspace);
+        NativeInt4QKGemm(M, N, K, Alpha, B, C, ldc, workspace, ThreadPool);
+        return;
+    }
     if (UsesNativeInt8Gemm(QuantType)) {
         NativeInt8Workspace workspace;
         PrepareNativeInt8Query(M, K, A, lda, Scales, workspace);
@@ -672,10 +1207,17 @@ MlasQKGemm(
         return;
     }
 
+    if (UsesFp8HalfGemm(QuantType)) {
+        Fp8HalfWorkspace workspace;
+        PrepareFp8HalfQuery(M, K, A, lda, workspace);
+        Fp8HalfQKGemm(M, N, K, Alpha, B, QuantType, Scales, C, ldc, workspace, ThreadPool);
+        return;
+    }
+
     if (UsesDecodedGemm(QuantType)) {
-        std::vector<float> decoded(SafeInt<size_t>(N) * K);
-        MlasKVDequantize(B, decoded.data(), N, K, K, QuantType, Scales, nullptr);
-        MlasGemm(CblasNoTrans, CblasTrans, M, N, K, Alpha, A, lda, decoded.data(), K, 0.0f, C, ldc, ThreadPool, nullptr);
+        DecodedGemmWorkspace workspace;
+        PrepareDecodedQuery(M, K, A, lda, workspace);
+        DecodedQKGemm(M, N, K, Alpha, B, QuantType, Scales, C, ldc, workspace, ThreadPool);
         return;
     }
 
@@ -761,6 +1303,12 @@ MlasQKGemmFp16(
         return;
     }
 
+    if (UsesNativeInt4Gemm(QuantType)) {
+        NativeInt4Workspace workspace;
+        PrepareNativeInt4Query(M, K, A, lda, Scales, workspace);
+        NativeInt4QKGemm(M, N, K, Alpha, B, C, ldc, workspace, ThreadPool);
+        return;
+    }
     if (UsesNativeInt8Gemm(QuantType)) {
         NativeInt8Workspace workspace;
         PrepareNativeInt8Query(M, K, A, lda, Scales, workspace);
@@ -768,14 +1316,17 @@ MlasQKGemmFp16(
         return;
     }
 
+    if (UsesFp8HalfGemm(QuantType)) {
+        Fp8HalfWorkspace workspace;
+        PrepareFp8HalfQuery(M, K, A, lda, workspace);
+        Fp8HalfQKGemm(M, N, K, Alpha, B, QuantType, Scales, C, ldc, workspace, ThreadPool);
+        return;
+    }
+
     if (UsesDecodedGemm(QuantType)) {
-        std::vector<float> query(SafeInt<size_t>(M) * K);
-        for (size_t m = 0; m < M; ++m) {
-            for (size_t k = 0; k < K; ++k) {
-                query[m * K + k] = static_cast<float>(A[m * lda + k]);
-            }
-        }
-        MlasQKGemm(M, N, K, Alpha, query.data(), K, B, QuantType, Scales, C, ldc, ThreadPool);
+        DecodedGemmWorkspace workspace;
+        PrepareDecodedQuery(M, K, A, lda, workspace);
+        DecodedQKGemm(M, N, K, Alpha, B, QuantType, Scales, C, ldc, workspace, ThreadPool);
         return;
     }
 
@@ -844,16 +1395,37 @@ MlasSVGemm(
         return;
     }
 
+    if (UsesNativeInt4Gemm(QuantType)) {
+        NativeInt4Workspace workspace;
+        NativeInt4SVGemm(M, N, K, A, lda, B, Scales, C, ldc, Beta, workspace, ThreadPool);
+        return;
+    }
     if (UsesNativeInt8Gemm(QuantType)) {
         NativeInt8Workspace workspace;
         NativeInt8SVGemm(M, N, K, A, lda, B, Scales, C, ldc, Beta, workspace, ThreadPool);
         return;
     }
 
+    if (UsesFp8HalfGemm(QuantType)) {
+        if (K > 128) {
+            ORT_ENFORCE(MlasIsKVQuantGemmSupported(QuantType),
+                        "FP8 FP16 compute requires accelerated half GEMMs");
+            ValidateKVScales(Scales, N, "FP8 KV");
+            const auto decoded_type = IsFp8E4M3Mode(QuantType)
+                ? MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel
+                : MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel;
+            DecodedGemmWorkspace workspace;
+            DecodedSVGemm(M, N, K, A, lda, B, decoded_type, Scales, C, ldc, Beta, workspace, ThreadPool);
+            return;
+        }
+        Fp8HalfWorkspace workspace;
+        Fp8HalfSVGemm(M, N, K, A, lda, B, QuantType, Scales, C, ldc, Beta, workspace, ThreadPool);
+        return;
+    }
+
     if (UsesDecodedGemm(QuantType)) {
-        std::vector<float> decoded(SafeInt<size_t>(K) * N);
-        MlasKVDequantize(B, decoded.data(), K, N, N, QuantType, Scales, nullptr);
-        MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.0f, A, lda, decoded.data(), N, Beta, C, ldc, ThreadPool, nullptr);
+        DecodedGemmWorkspace workspace;
+        DecodedSVGemm(M, N, K, A, lda, B, QuantType, Scales, C, ldc, Beta, workspace, ThreadPool);
         return;
     }
 
@@ -944,7 +1516,8 @@ MlasSVGemmFp16(
         return;
     }
 
-    if (UsesDecodedGemm(QuantType) || UsesNativeInt8Gemm(QuantType)) {
+    if (UsesDecodedGemm(QuantType) || UsesNativeInt8Gemm(QuantType) ||
+        UsesNativeInt4Gemm(QuantType) || UsesFp8HalfGemm(QuantType)) {
         std::vector<float> output(SafeInt<size_t>(M) * N);
         if (Beta != 0.0f) {
             for (size_t m = 0; m < M; ++m) {

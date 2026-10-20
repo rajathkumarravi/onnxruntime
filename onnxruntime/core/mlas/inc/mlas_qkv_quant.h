@@ -44,11 +44,26 @@ Abstract:
 
     Experimental FP8 modes use one scale per column and byte storage. They
     dequantize the current attention tile for FP32 GEMM; they do not require
-    or claim hardware FP8 arithmetic.
+    or claim hardware FP8 arithmetic. Flash attention reuses worker-local
+    conversion scratch and prepares each query tile once, without retaining
+    a full decoded copy of the KV cache.
+
+    Opt-in FP8 FP16-compute modes decode bounded tiles into FP16 for native
+    half GEMMs, with FP32 softmax and accumulation across 128-element value
+    reductions. These modes
+    retain FP32 GEMM for untiled SV reductions longer than 128 elements to
+    avoid accumulating long normalized-probability reductions in FP16. They
+    require accelerated half GEMMs and add FP16 arithmetic rounding.
 
     The experimental ARM64 native INT8 mode preserves per-channel INT8 KV
     storage but also dynamically quantizes queries and softmax rows for
     integer GEMM. It requires finite activations and positive finite scales.
+
+    The experimental native INT4 mode retains biased-nibble KV storage and
+    uses SIMD-unpacked INT8 tiles with ARM64 integer attention. Other supported
+    platforms use MLAS blocked INT4 GEMM. Both paths dynamically quantize
+    activations, fold K channel scales into Q, and preserve FP32 softmax/output.
+    No persistent decoded copy of the KV cache is retained.
 
 --*/
 
@@ -77,12 +92,17 @@ enum class MLAS_KV_QUANT_TYPE {
     S8_PerChannel_Gemm = 6,
     S4_PerChannel_Gemm = 7,
     S8_PerChannel_Native = 8,
+    F8E4M3FN_PerChannel_Fp16 = 9,
+    F8E5M2_PerChannel_Fp16 = 10,
+    S4_PerChannel_Native = 11,
 };
 
 /**
  * @brief Returns true if MlasKVQuantize / MlasQKGemm / MlasSVGemm /
  *        MlasKVDequantize are available for the requested mode on the current
- *        platform. The native INT8 mode currently requires ARM64.
+ *        platform. Native INT4 requires an available integer GEMM path.
+ *        The native INT8 mode currently requires ARM64; FP8 FP16
+ *        compute requires accelerated half GEMMs for both attention products.
  */
 bool
 MLASCALL
@@ -302,9 +322,9 @@ MlasSVGemm(
 /**
  * @brief FP16-output variant of MlasSVGemm.
  *
- * Accumulation is FP32, but C is read and written directly as FP16. SIMD
- * backends retain FP32 accumulators in registers and convert only the final
- * values, avoiding an FP16-to-FP32 output conversion buffer.
+ * C is read and written as FP16. Ordinary modes accumulate in FP32; the
+ * opt-in FP8 FP16-compute modes use half GEMM products before applying Beta
+ * in FP32. SIMD backends for ordinary modes can convert only the final values.
  */
 void
 MLASCALL
@@ -327,7 +347,7 @@ MlasSVGemmFp16(
  * @brief Arguments for the Flash Attention kernel with quantized KV cache.
  *
  * This kernel implements the online-softmax tiled Flash Attention algorithm
- * operating directly on INT8/INT4 quantized K and V cache buffers.
+ * operating on INT8/INT4/FP8 quantized K and V cache buffers.
  * It avoids materializing the full [S, T] attention probability matrix.
  */
 struct MlasFlashAttentionQuantizedKVArgs {

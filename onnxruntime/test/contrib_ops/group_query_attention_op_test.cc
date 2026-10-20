@@ -3,10 +3,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#if defined(_M_ARM64)
+#include <intrin.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -24,6 +29,8 @@
 #include "core/graph/model.h"
 #include "core/mlas/inc/mlas.h"
 #include "core/mlas/inc/mlas_qkv_quant.h"
+#include "core/mlas/inc/mlas_qnbit.h"
+#include "core/mlas/lib/qkv_quant_common.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/platform/env.h"
 #include "core/platform/threadpool.h"
@@ -3163,11 +3170,15 @@ struct QuantGQAConfig {
   bool disable_flash = false;
   bool use_decoded_gemm = false;
   bool use_native_int8 = false;
+  bool use_native_int4 = false;
 };
 
 void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
   if (cfg.use_native_int8 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
     GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+  }
+  if (cfg.use_native_int4 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT4 integer GEMM is not available";
   }
   const int hidden_size = cfg.num_heads * cfg.head_size;
   const int kv_hidden_size = cfg.kv_num_heads * cfg.head_size;
@@ -3195,6 +3206,7 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
   tester.AddAttribute<int64_t>("num_heads", static_cast<int64_t>(cfg.num_heads));
   tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(cfg.kv_num_heads));
   const auto quant_type = cfg.use_native_int8 ? std::string("PER_CHANNEL_INT8_NATIVE")
+                         : cfg.use_native_int4 ? std::string("PER_CHANNEL_INT4_NATIVE")
                                             : cfg.use_decoded_gemm ? std::string("PER_CHANNEL_GEMM") : cfg.quant_type;
   tester.AddAttribute<std::string>("k_quant_type", quant_type);
   tester.AddAttribute<std::string>("v_quant_type", quant_type);
@@ -3367,8 +3379,8 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
           for (int d = 0; d < cfg.head_size; d++) {
             int bnsh_idx = ((b * cfg.kv_num_heads + n) * cfg.seq_len + s) * cfg.head_size + d;
             int bsnh_idx = (b * cfg.seq_len + s) * kv_hidden_size + n * cfg.head_size + d;
-            K_bnsh[bnsh_idx] = key_data[bsnh_idx];
-            V_bnsh[bnsh_idx] = value_data[bsnh_idx];
+            K_bnsh[bnsh_idx] = cfg.use_fp16 ? MLFloat16(key_data[bsnh_idx]).ToFloat() : key_data[bsnh_idx];
+            V_bnsh[bnsh_idx] = cfg.use_fp16 ? MLFloat16(value_data[bsnh_idx]).ToFloat() : value_data[bsnh_idx];
           }
         }
       }
@@ -3403,15 +3415,29 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
       for (size_t i = 0; i < V_deq.size(); i++) V_deq[i] = v_q[i] * get_v_scale(i);
     } else {
       std::vector<uint8_t> k_p((K_bnsh.size() + 1) / 2), v_p((V_bnsh.size() + 1) / 2);
+      const auto quantize_int4 = [](float value, float scale) {
+        return static_cast<int8_t>(std::nearbyint(std::clamp(value * (1.0f / scale), -8.0f, 7.0f)));
+      };
       for (size_t i = 0; i < K_bnsh.size(); i += 2) {
-        int8_t q0 = static_cast<int8_t>(std::round(std::clamp(K_bnsh[i] / get_k_scale(i), -8.0f, 7.0f)));
-        int8_t q1 = static_cast<int8_t>(std::round(std::clamp(K_bnsh[i + 1] / get_k_scale(i + 1), -8.0f, 7.0f)));
+        int8_t q0 = quantize_int4(K_bnsh[i], get_k_scale(i));
+        int8_t q1 = quantize_int4(K_bnsh[i + 1], get_k_scale(i + 1));
         k_p[i / 2] = PackInt4(q0, q1);
       }
       for (size_t i = 0; i < V_bnsh.size(); i += 2) {
-        int8_t q0 = static_cast<int8_t>(std::round(std::clamp(V_bnsh[i] / get_v_scale(i), -8.0f, 7.0f)));
-        int8_t q1 = static_cast<int8_t>(std::round(std::clamp(V_bnsh[i + 1] / get_v_scale(i + 1), -8.0f, 7.0f)));
+        int8_t q0 = quantize_int4(V_bnsh[i], get_v_scale(i));
+        int8_t q1 = quantize_int4(V_bnsh[i + 1], get_v_scale(i + 1));
         v_p[i / 2] = PackInt4(q0, q1);
+      }
+      if (cfg.use_native_int4) {
+        ASSERT_EQ(fetches.size(), size_t{3});
+        const auto& actual_key = fetches[1].Get<Tensor>();
+        const auto& actual_value = fetches[2].Get<Tensor>();
+        ASSERT_EQ(actual_key.Shape().Size(), static_cast<int64_t>(k_p.size()));
+        ASSERT_EQ(actual_value.Shape().Size(), static_cast<int64_t>(v_p.size()));
+        for (size_t i = 0; i < k_p.size(); ++i) {
+          ASSERT_EQ(actual_key.Data<uint8_t>()[i], k_p[i]) << "Key byte " << i;
+          ASSERT_EQ(actual_value.Data<uint8_t>()[i], v_p[i]) << "Value byte " << i;
+        }
       }
       // Dequantize using per-element scale (unpack nibbles back).
       for (size_t i = 0; i < K_bnsh.size(); i += 2) {
@@ -3434,7 +3460,7 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
           for (int d = 0; d < cfg.head_size; d++) {
             int bnsh_idx = ((b * cfg.num_heads + n) * cfg.seq_len + s) * cfg.head_size + d;
             int bsnh_idx = (b * cfg.seq_len + s) * hidden_size + n * cfg.head_size + d;
-            Q_bnsh[bnsh_idx] = query_data[bsnh_idx];
+            Q_bnsh[bnsh_idx] = cfg.use_fp16 ? MLFloat16(query_data[bsnh_idx]).ToFloat() : query_data[bsnh_idx];
           }
         }
       }
@@ -3447,7 +3473,7 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
                  cfg.seq_len, cfg.head_size, /*causal=*/true);
 
     // Compare with tolerance
-    float atol = cfg.use_native_int8 ? 0.01f : (cfg.bit_width == 4) ? 0.15f : 0.05f;
+    float atol = cfg.use_native_int8 || cfg.use_native_int4 ? 0.01f : (cfg.bit_width == 4) ? 0.15f : 0.05f;
     for (int i = 0; i < output_size; i++) {
       float diff = std::fabs(out_data[i] - ref_output[i]);
       EXPECT_LE(diff, atol)
@@ -3467,13 +3493,17 @@ void RunQuantizedGQAPromptTest(const QuantGQAConfig& cfg) {
   }
 }
 
-void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false, bool use_native_int8 = false) {
+void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false,
+                                 bool use_native_int8 = false, bool use_native_int4 = false, int past_length = 1) {
   if (use_native_int8 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)) {
     GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
   }
+  if (use_native_int4 && !MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT4 integer GEMM is not available";
+  }
   constexpr int batch_size = 1;
   constexpr int sequence_length = 1;
-  constexpr int cache_length = 2;
+  const int cache_length = past_length + 1;
   constexpr int num_heads = 2;
   constexpr int kv_num_heads = 1;
   constexpr int head_size = 8;
@@ -3485,6 +3515,7 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false,
   tester.AddAttribute<int64_t>("num_heads", static_cast<int64_t>(num_heads));
   tester.AddAttribute<int64_t>("kv_num_heads", static_cast<int64_t>(kv_num_heads));
   const std::string quant_type = use_native_int8 ? "PER_CHANNEL_INT8_NATIVE"
+                              : use_native_int4 ? "PER_CHANNEL_INT4_NATIVE"
                                                : use_decoded_gemm ? "PER_CHANNEL_GEMM" : "PER_TENSOR";
   tester.AddAttribute<std::string>("k_quant_type", quant_type);
   tester.AddAttribute<std::string>("v_quant_type", quant_type);
@@ -3500,13 +3531,15 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false,
   if (bit_width == 4) {
     tester.AddInput<uint8_t>("past_key", {batch_size, kv_num_heads, cache_length, packed_head_size},
                              std::vector<uint8_t>(cache_length * packed_head_size, 0x88));
+    std::vector<uint8_t> past_value(cache_length * packed_head_size, 0x88);
+    std::fill_n(past_value.begin(), past_length * packed_head_size, 0xAA);
     tester.AddInput<uint8_t>("past_value", {batch_size, kv_num_heads, cache_length, packed_head_size},
-                             {0xAA, 0xAA, 0xAA, 0xAA, 0x88, 0x88, 0x88, 0x88});
+                             past_value);
   } else {
     tester.AddInput<int8_t>("past_key", {batch_size, kv_num_heads, cache_length, packed_head_size},
                             std::vector<int8_t>(cache_length * packed_head_size, 0));
     std::vector<int8_t> past_value(cache_length * packed_head_size, 0);
-    std::fill_n(past_value.begin(), head_size, 10);
+    std::fill_n(past_value.begin(), past_length * head_size, 10);
     tester.AddInput<int8_t>("past_value", {batch_size, kv_num_heads, cache_length, packed_head_size}, past_value);
   }
 
@@ -3518,22 +3551,25 @@ void RunQuantizedGQAFp16DecodeTest(int bit_width, bool use_decoded_gemm = false,
   tester.AddOptionalInputEdge<MLFloat16>();  // attention_bias
   tester.AddOptionalInputEdge<MLFloat16>();  // head_sink
   const float scale = bit_width == 4 ? 0.05f : 0.01f;
-  const int scale_size = use_decoded_gemm || use_native_int8 ? head_size : 1;
+  const int scale_size = use_decoded_gemm || use_native_int8 || use_native_int4 ? head_size : 1;
   tester.AddInput<float>("k_scale", {scale_size}, std::vector<float>(scale_size, scale));
   tester.AddInput<float>("v_scale", {scale_size}, std::vector<float>(scale_size, scale));
 
+  const float expected = (0.1f * static_cast<float>(past_length) + 0.3f) / static_cast<float>(cache_length);
   tester.AddOutput<MLFloat16>("output", {batch_size, sequence_length, hidden_size},
-                              std::vector<MLFloat16>(hidden_size, MLFloat16(0.2f)));
+                              std::vector<MLFloat16>(hidden_size, MLFloat16(expected)));
   if (bit_width == 4) {
     tester.AddOutput<uint8_t>("present_key", {batch_size, kv_num_heads, cache_length, packed_head_size},
                               std::vector<uint8_t>(cache_length * packed_head_size, 0x88));
+    std::vector<uint8_t> present_value(cache_length * packed_head_size, 0xEE);
+    std::fill_n(present_value.begin(), past_length * packed_head_size, 0xAA);
     tester.AddOutput<uint8_t>("present_value", {batch_size, kv_num_heads, cache_length, packed_head_size},
-                              {0xAA, 0xAA, 0xAA, 0xAA, 0xEE, 0xEE, 0xEE, 0xEE});
+                              present_value);
   } else {
     tester.AddOutput<int8_t>("present_key", {batch_size, kv_num_heads, cache_length, packed_head_size},
                              std::vector<int8_t>(cache_length * packed_head_size, 0));
     std::vector<int8_t> present_value(cache_length * packed_head_size, 30);
-    std::fill_n(present_value.begin(), head_size, 10);
+    std::fill_n(present_value.begin(), past_length * head_size, 10);
     tester.AddOutput<int8_t>("present_value", {batch_size, kv_num_heads, cache_length, packed_head_size},
                              present_value);
   }
@@ -3575,6 +3611,26 @@ TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16EightRows) {
 
 TEST(GroupQueryAttentionTest, NativeInt8KV_FloatBatchedNonFlash) {
   RunQuantizedGQAPromptTest({2, 8, 6, 2, 128, "PER_CHANNEL", 8, false, true, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_Fp16Decode) {
+  RunQuantizedGQAFp16DecodeTest(4, false, false, true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_Fp16Prefill128) {
+  RunQuantizedGQAPromptTest({1, 128, 6, 2, 128, "PER_CHANNEL", 4, true, false, false, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_Fp16EightRows) {
+  RunQuantizedGQAPromptTest({1, 8, 6, 2, 128, "PER_CHANNEL", 4, true, false, false, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_FloatBatchedNonFlash) {
+  RunQuantizedGQAPromptTest({2, 8, 6, 2, 128, "PER_CHANNEL", 4, false, true, false, false, true});
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_Fp16LargeCache) {
+  RunQuantizedGQAFp16DecodeTest(4, false, false, true, 1025);
 }
 
 // INT8 per-tensor prompt test
@@ -8047,28 +8103,34 @@ TEST(GroupQueryAttentionTest, NativeInt8KV_Fp16MaskedDecode) {
   RunNativeInt8MaskedDecodeTest();
 }
 
-TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
-  constexpr auto type = MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
+namespace {
+
+void RunQuantizedKVFlashLayoutsTest(MLAS_KV_QUANT_TYPE type, bool split_decode = false) {
   if (!MlasIsKVQuantGemmSupported(type)) {
-    GTEST_SKIP() << "Native INT8 KV arithmetic requires ARM64";
+    GTEST_SKIP() << "Requested quantized KV arithmetic is not supported";
   }
-  constexpr int batches = 2, heads = 6, kv_heads = 2, d = 7, sequence = 11, past = 17;
-  constexpr int total = past + sequence, capacity = total + 3, q_block = 4, kv_block = 6;
-  constexpr int threads = 3, guard = 17, bias_stride = total + 2;
-  constexpr int q_batch_stride = heads * sequence * d + 5;
-  constexpr int output_count = batches * sequence * heads * d;
-  constexpr int scratch_count = q_block * (2 + kv_block + d);
+  const bool fp8 = MlasKVQuantInternal::IsFp8Mode(type);
+  constexpr int batches = 2, heads = 6, kv_heads = 2, d = 7, past = 17, kv_block = 6;
+  constexpr int threads = 3, guard = 17;
+  const int sequence = split_decode ? 1 : 11, q_block = split_decode ? 1 : 4;
+  const int total = past + sequence, capacity = total + 3, bias_stride = total + 2;
+  const int q_batch_stride = heads * sequence * d + 5;
+  const int output_count = batches * sequence * heads * d;
+  const int scratch_count = q_block * (2 + kv_block + d);
+  const size_t cache_stride = MlasKVQuantPackedRowBytes(type, d);
   constexpr float sentinel = -1234.0f;
   std::vector<float> query(batches * q_batch_stride), key_scales(kv_heads * d), value_scales(kv_heads * d);
   std::vector<MLFloat16> query_fp16(query.size());
-  std::vector<int8_t> key(batches * kv_heads * capacity * d), value(key.size());
+  std::vector<int8_t> key(batches * kv_heads * capacity * cache_stride), value(key.size());
   for (size_t i = 0; i < query.size(); ++i) {
     query[i] = static_cast<float>(static_cast<int>(i % 37) - 18) * 0.125f;
     query_fp16[i] = MLFloat16(query[i]);
   }
   for (size_t i = 0; i < key.size(); ++i) {
-    key[i] = static_cast<int8_t>(static_cast<int>(i % 63) - 31);
-    value[i] = static_cast<int8_t>(static_cast<int>((i * 7) % 61) - 30);
+    key[i] = fp8 ? static_cast<int8_t>((0x40 + i % 31) | ((i % 2) << 7))
+                 : static_cast<int8_t>(static_cast<int>(i % 63) - 31);
+    value[i] = fp8 ? static_cast<int8_t>((0x40 + (i * 7) % 31) | ((i % 3 == 0) << 7))
+                   : static_cast<int8_t>(static_cast<int>((i * 7) % 61) - 30);
   }
   for (size_t i = 0; i < key_scales.size(); ++i) {
     key_scales[i] = 0.01f + 0.003f * static_cast<float>(i % 4);
@@ -8136,7 +8198,7 @@ TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
               single.query = fp16 ? nullptr : query.data() + q_offset;
               single.query_fp16 = fp16 ? query_fp16.data() + q_offset : nullptr;
               const int kv_head = head / (heads / kv_heads);
-              const int kv_offset = (batch * kv_heads + kv_head) * capacity * d;
+              const size_t kv_offset = (batch * kv_heads + kv_head) * capacity * cache_stride;
               single.k_cache = args.k_cache + kv_offset;
               single.v_cache = args.v_cache + kv_offset;
               single.k_scale = key_scales.data() + kv_head * d;
@@ -8160,6 +8222,32 @@ TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
               }
             }
           }
+          if (split_decode) {
+            const int chunks = (total + kv_block - 1) / kv_block;
+            const int partial_count = batches * heads * chunks * (2 + d);
+            std::vector<float> partials(partial_count + 2 * guard, sentinel);
+            std::vector<float> split_output(output.size(), sentinel);
+            std::vector<MLFloat16> split_half(output.size(), MLFloat16(sentinel));
+            auto split = args;
+            split.flash_decoding_partials = partials.data() + guard;
+            split.kv_chunk_count = chunks;
+            split.output = fp16 ? nullptr : split_output.data() + guard;
+            split.output_fp16 = fp16 ? split_half.data() + guard : nullptr;
+            MlasFlashAttentionQuantizedKV(&split, nullptr);
+            for (int i = 0; i < output_count; ++i) {
+              const float actual = fp16 ? split_half[guard + i].ToFloat() : split_output[guard + i];
+              const float expected = fp16 ? output_fp16[guard + i].ToFloat() : output[guard + i];
+              ASSERT_NEAR(actual, expected, 0.001f);
+            }
+            for (int i = 0; i < guard; ++i) {
+              EXPECT_EQ(partials[i], sentinel);
+              EXPECT_EQ(partials[guard + partial_count + i], sentinel);
+              EXPECT_EQ(split_output[i], sentinel);
+              EXPECT_EQ(split_output[guard + output_count + i], sentinel);
+              EXPECT_EQ(split_half[i].val, MLFloat16(sentinel).val);
+              EXPECT_EQ(split_half[guard + output_count + i].val, MLFloat16(sentinel).val);
+            }
+          }
           for (int i = 0; i < guard; ++i) {
             EXPECT_EQ(scratch[i], sentinel);
             EXPECT_EQ(scratch[guard + threads * scratch_count + i], sentinel);
@@ -8172,6 +8260,20 @@ TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
       }
     }
   }
+}
+
+}  // namespace
+
+TEST(GroupQueryAttentionTest, NativeInt8KV_MlasFlashLayouts) {
+  RunQuantizedKVFlashLayoutsTest(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasFlashLayouts) {
+  RunQuantizedKVFlashLayoutsTest(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasFlashDecoding) {
+  RunQuantizedKVFlashLayoutsTest(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native, true);
 }
 
 TEST(GroupQueryAttentionTest, NativeInt8KV_RejectsNonpositiveScales) {
@@ -8211,17 +8313,30 @@ float Fp8KvValue(uint8_t value, bool e5m2) {
               : Float8E4M3FN(value, Float8E4M3FN::FromBits()).ToFloat();
 }
 
-void RunFp8KvMlasTest(bool e5m2) {
-  constexpr size_t m = 8, n = 37, d = 128;
-  constexpr size_t query_stride = d + 3, source_stride = d + 5, score_stride = n + 2, output_stride = d + 3;
-  const auto type = e5m2 ? MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel : MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel;
+MLAS_KV_QUANT_TYPE Fp8KvMlasType(bool e5m2, bool half_compute) {
+  if (half_compute) {
+    return e5m2 ? MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel_Fp16 : MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel_Fp16;
+  }
+  return e5m2 ? MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel : MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel;
+}
+
+void RunFp8KvMlasTest(bool e5m2, bool half_compute = false, size_t m = 8, size_t d = 128) {
+  constexpr size_t n = 37;
+  const size_t query_stride = d + 3, source_stride = d + 5, score_stride = n + 2, output_stride = d + 3;
+  const auto type = Fp8KvMlasType(e5m2, half_compute);
+  if (half_compute && !MlasIsKVQuantGemmSupported(type)) {
+    GTEST_SKIP() << "Accelerated half GEMMs are not available";
+  }
   ASSERT_TRUE(MlasIsKVQuantGemmSupported(type));
   ASSERT_EQ(MlasKVQuantPackedRowBytes(type, d), d);
   std::vector<float> scales(d), query(m * query_stride), source(n * source_stride), decoded(n * d);
   std::vector<MLFloat16> half_query(query.size()), half_source(source.size());
-  for (size_t i = 0; i < d; ++i) scales[i] = std::ldexp(1.0f, static_cast<int>(i % 4) - 6);
+  for (size_t i = 0; i < d; ++i) {
+    scales[i] = half_compute ? 0.019f + 0.003f * static_cast<float>(i % 7)
+                            : std::ldexp(1.0f, static_cast<int>(i % 4) - 6);
+  }
   for (size_t i = 0; i < query.size(); ++i) {
-    query[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 31) - 15);
+    query[i] = (half_compute ? 0.03187f : 0.03125f) * static_cast<float>(static_cast<int>(i % 31) - 15);
     half_query[i] = MLFloat16(query[i]);
   }
   for (size_t i = 0; i < source.size(); ++i) {
@@ -8236,7 +8351,7 @@ void RunFp8KvMlasTest(bool e5m2) {
   EXPECT_EQ(packed.back(), 0xa5);
   for (size_t row = 0; row < n; ++row) {
     for (size_t col = 0; col < d; ++col) {
-      const auto expected = Fp8KvBits(source[row * source_stride + col] / scales[col], e5m2);
+      const auto expected = Fp8KvBits(source[row * source_stride + col] * (1.0f / scales[col]), e5m2);
       ASSERT_EQ(packed[1 + row * d + col], expected);
       decoded[row * d + col] = Fp8KvValue(expected, e5m2) * scales[col];
     }
@@ -8252,17 +8367,34 @@ void RunFp8KvMlasTest(bool e5m2) {
              type, scales.data(), scores.data(), score_stride, nullptr);
   MlasQKGemmFp16(m, n, d, 0.125f, half_query.data(), query_stride, packed.data() + 1,
                  type, scales.data(), half_scores.data(), score_stride, nullptr);
+  std::vector<MLFloat16> decoded_half(decoded.size()), reference_scores(m * n);
+  if (half_compute) {
+    std::transform(decoded.begin(), decoded.end(), decoded_half.begin(), [](float value) { return MLFloat16(value); });
+    MlasGemm(CblasNoTrans, CblasTrans, m, n, d, half_query.data(), query_stride, decoded_half.data(), d,
+             reference_scores.data(), n, MLFloat16(0.125f).val, uint16_t{0}, nullptr);
+  }
   for (size_t row = 0; row < m; ++row) {
     for (size_t col = 0; col < n; ++col) {
       float expected = 0;
       for (size_t k = 0; k < d; ++k) expected += query[row * query_stride + k] * decoded[col * d + k];
-      EXPECT_NEAR(scores[row * score_stride + col], expected * 0.125f, 0.0002f);
-      EXPECT_NEAR(half_scores[row * score_stride + col], expected * 0.125f, 0.0002f);
+      if (half_compute) {
+        ASSERT_FLOAT_EQ(scores[row * score_stride + col], reference_scores[row * n + col].ToFloat());
+        ASSERT_FLOAT_EQ(half_scores[row * score_stride + col], reference_scores[row * n + col].ToFloat());
+      }
+      const float tolerance = half_compute ? 0.003f + 0.01f * std::abs(expected * 0.125f) : 0.0002f;
+      EXPECT_NEAR(scores[row * score_stride + col], expected * 0.125f, tolerance);
+      EXPECT_NEAR(half_scores[row * score_stride + col], expected * 0.125f, tolerance);
     }
     EXPECT_FLOAT_EQ(scores[row * score_stride + n], 123.0f);
     EXPECT_FLOAT_EQ(half_scores[row * score_stride + n], 123.0f);
   }
   for (size_t i = 0; i < scores.size(); ++i) scores[i] = static_cast<float>(i % 13) / 128.0f;
+  std::vector<MLFloat16> probabilities(scores.size()), reference_output(m * d);
+  if (half_compute) {
+    std::transform(scores.begin(), scores.end(), probabilities.begin(), [](float value) { return MLFloat16(value); });
+    MlasGemm(CblasNoTrans, CblasNoTrans, m, d, n, probabilities.data(), score_stride, decoded_half.data(), d,
+             reference_output.data(), d, MLFloat16(1.0f).val, uint16_t{0}, nullptr);
+  }
   for (float beta : {0.0f, 0.5f, 1.0f}) {
     std::vector<float> output(m * output_stride, 0.25f);
     std::vector<MLFloat16> half_output(output.size(), MLFloat16(0.25f));
@@ -8274,8 +8406,13 @@ void RunFp8KvMlasTest(bool e5m2) {
       for (size_t col = 0; col < d; ++col) {
         float expected = beta * 0.25f;
         for (size_t k = 0; k < n; ++k) expected += scores[row * score_stride + k] * decoded[k * d + col];
-        EXPECT_NEAR(output[row * output_stride + col], expected, 0.0002f);
-        EXPECT_NEAR(half_output[row * output_stride + col].ToFloat(), expected, 0.002f);
+        if (half_compute) {
+          const float native_expected = beta * 0.25f + reference_output[row * d + col].ToFloat();
+          ASSERT_FLOAT_EQ(output[row * output_stride + col], native_expected);
+          ASSERT_EQ(half_output[row * output_stride + col].val, MLFloat16(native_expected).val);
+        }
+        EXPECT_NEAR(output[row * output_stride + col], expected, half_compute ? 0.004f : 0.0002f);
+        EXPECT_NEAR(half_output[row * output_stride + col].ToFloat(), expected, half_compute ? 0.005f : 0.002f);
       }
       EXPECT_FLOAT_EQ(output[row * output_stride + d], 0.25f);
       EXPECT_FLOAT_EQ(half_output[row * output_stride + d].ToFloat(), 0.25f);
@@ -8283,9 +8420,17 @@ void RunFp8KvMlasTest(bool e5m2) {
   }
 }
 
-void RunFp8KvDecodeTest(bool e5m2, bool invalid_scale = false, bool unsigned_storage = false) {
-  constexpr int heads = 4, kv_heads = 2, d = 128, past = 5, sequence = 8, capacity = past + sequence;
-  const std::string type = e5m2 ? "FP8E5M2_PER_CHANNEL" : "FP8E4M3FN_PER_CHANNEL";
+void RunFp8KvDecodeTest(bool e5m2, bool invalid_scale = false, bool unsigned_storage = false,
+                       bool half_compute = false, int past = 5, int sequence = 8) {
+  SCOPED_TRACE(testing::Message() << "e5m2=" << e5m2 << ",half=" << half_compute
+                                << ",past=" << past << ",sequence=" << sequence);
+  if (half_compute && !MlasIsKVQuantGemmSupported(Fp8KvMlasType(e5m2, true))) {
+    GTEST_SKIP() << "Accelerated half GEMMs are not available";
+  }
+  constexpr int heads = 4, kv_heads = 2, d = 128;
+  const int capacity = past + sequence;
+  const std::string type = std::string(e5m2 ? "FP8E5M2_PER_CHANNEL" : "FP8E4M3FN_PER_CHANNEL") +
+                           (half_compute ? "_FP16" : "");
   std::vector<float> scales(kv_heads * d);
   std::vector<uint8_t> past_key(kv_heads * capacity * d), past_value(past_key.size());
   std::vector<uint8_t> present_value(past_value.size());
@@ -8390,7 +8535,733 @@ TEST(GroupQueryAttentionTest, Fp8KV_RejectsNonpositiveScales) {
 TEST(GroupQueryAttentionTest, Fp8KV_RejectsUnsignedStorage) {
   RunFp8KvDecodeTest(false, false, true);
 }
+
+TEST(GroupQueryAttentionTest, Fp8KV_CodecAllHalfEncodingsAndTails) {
+  constexpr size_t count = 65536 + 7;
+  std::vector<float> source(count), scales(count);
+  std::vector<MLFloat16> source_half(count);
+  for (size_t i = 0; i < count; ++i) {
+    source_half[i].val = static_cast<uint16_t>(i);
+    source[i] = source_half[i].ToFloat();
+  }
+  for (bool e5m2 : {false, true}) {
+    for (bool half_compute : {false, true}) {
+      const auto type = Fp8KvMlasType(e5m2, half_compute);
+      for (float scale : {0.0f, 1.0f, 0.5f, 2.0f, 0.0037f, 1.7f, 1e-8f, 1e8f}) {
+        SCOPED_TRACE(testing::Message() << e5m2 << "," << half_compute << "," << scale);
+        std::fill(scales.begin(), scales.end(), scale);
+        std::vector<uint8_t> packed(count + 2, 0xa5), half_packed(packed);
+        MlasKVQuantize(source.data(), packed.data() + 1, 1, count, count, type, scales.data(), nullptr);
+        MlasKVQuantizeFp16(source_half.data(), half_packed.data() + 1, 1, count, count,
+                           type, scales.data(), nullptr);
+        ASSERT_EQ(packed, half_packed);
+        ASSERT_EQ(packed.front(), 0xa5);
+        ASSERT_EQ(packed.back(), 0xa5);
+        for (size_t i = 0; i < count; ++i) {
+          const auto expected = Fp8KvBits(source[i] * (scale == 0.0f ? 1.0f : 1.0f / scale), e5m2);
+          ASSERT_EQ(packed[i + 1], expected) << "half bits: " << source_half[i].val;
+        }
+      }
+    }
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_CodecRoundingBoundariesAndAllBytes) {
+  for (bool e5m2 : {false, true}) {
+    for (bool half_compute : {false, true}) {
+      SCOPED_TRACE(testing::Message() << e5m2 << "," << half_compute);
+      const auto type = Fp8KvMlasType(e5m2, half_compute);
+      std::vector<float> boundaries;
+      const int maximum = e5m2 ? 0x7b : 0x7e;
+      for (int code = 0; code < maximum; ++code) {
+        const float midpoint = (Fp8KvValue(static_cast<uint8_t>(code), e5m2) +
+                                Fp8KvValue(static_cast<uint8_t>(code + 1), e5m2)) * 0.5f;
+        for (float value : {std::nextafter(midpoint, 0.0f), midpoint,
+                            std::nextafter(midpoint, std::numeric_limits<float>::infinity())}) {
+          boundaries.push_back(value);
+          boundaries.push_back(-value);
+        }
+      }
+      std::vector<float> scales(boundaries.size(), 1.0f);
+      std::vector<uint8_t> packed(boundaries.size());
+      MlasKVQuantize(boundaries.data(), packed.data(), 1, boundaries.size(), boundaries.size(),
+                     type, scales.data(), nullptr);
+      for (size_t i = 0; i < boundaries.size(); ++i) {
+        ASSERT_EQ(packed[i], Fp8KvBits(boundaries[i], e5m2)) << "boundary: " << boundaries[i];
+      }
+      constexpr size_t count = 256 + 7, stride = count + 3;
+      packed.resize(2 * count);
+      scales.resize(count);
+      for (size_t i = 0; i < packed.size(); ++i) packed[i] = static_cast<uint8_t>(i);
+      for (size_t i = 0; i < count; ++i) scales[i] = 0.375f + 0.25f * static_cast<float>(i % 5);
+      std::vector<float> decoded(2 * stride, 123.0f);
+      MlasKVDequantize(packed.data(), decoded.data(), 2, count, stride, type, scales.data(), nullptr);
+      for (size_t row = 0; row < 2; ++row) {
+        for (size_t col = 0; col < count; ++col) {
+          const float expected = Fp8KvValue(packed[row * count + col], e5m2) * scales[col];
+          const float actual = decoded[row * stride + col];
+          ASSERT_EQ(std::signbit(actual), std::signbit(expected));
+          if (std::isnan(expected)) {
+            ASSERT_TRUE(std::isnan(actual));
+          } else {
+            ASSERT_FLOAT_EQ(actual, expected);
+          }
+        }
+        for (size_t col = count; col < stride; ++col) ASSERT_EQ(decoded[row * stride + col], 123.0f);
+      }
+    }
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_MlasSingleRowTails) {
+  for (bool e5m2 : {false, true}) RunFp8KvMlasTest(e5m2, true, 1, 7);
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_MlasEightRows) {
+  for (bool e5m2 : {false, true}) RunFp8KvMlasTest(e5m2, true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_MlasPrefill128) {
+  for (bool e5m2 : {false, true}) RunFp8KvMlasTest(e5m2, true, 128);
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_E4M3FN_Decode) {
+  RunFp8KvDecodeTest(false, false, false, true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_E5M2_Decode) {
+  RunFp8KvDecodeTest(true, false, false, true);
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_FlashLayouts) {
+  for (bool e5m2 : {false, true}) RunQuantizedKVFlashLayoutsTest(Fp8KvMlasType(e5m2, true));
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_FlashLayouts) {
+  for (bool e5m2 : {false, true}) RunQuantizedKVFlashLayoutsTest(Fp8KvMlasType(e5m2, false));
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_MlasPrefillAndTailStrides) {
+  for (bool e5m2 : {false, true}) {
+    RunFp8KvMlasTest(e5m2, false, 128);
+    RunFp8KvMlasTest(e5m2, false, 1, 7);
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_PrefillAcrossCacheTiles) {
+  for (bool e5m2 : {false, true}) {
+    for (bool half_compute : {false, true}) {
+      for (int sequence : {32, 128}) {
+        RunFp8KvDecodeTest(e5m2, false, false, half_compute, 513, sequence);
+      }
+    }
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_DecodeAcrossCacheTiles) {
+  for (bool e5m2 : {false, true}) {
+    for (bool half_compute : {false, true}) {
+      for (int sequence : {1, 8}) {
+        RunFp8KvDecodeTest(e5m2, false, false, half_compute, 521, sequence);
+      }
+    }
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_DecodedWorkspaceReuse) {
+  constexpr size_t m = 8, n = 37, d = 7, query_stride = d + 3, score_stride = n + 2, output_stride = d + 3;
+  constexpr float sentinel = -1234.0f;
+  for (bool e5m2 : {false, true}) {
+    const auto type = Fp8KvMlasType(e5m2, false);
+    std::vector<MLFloat16> query(m * query_stride, MLFloat16(0.125f));
+    std::vector<float> source(n * d), scales(d, 0.0625f);
+    for (size_t i = 0; i < source.size(); ++i) {
+      source[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 16.0f;
+    }
+    std::vector<uint8_t> cache(source.size());
+    MlasKVQuantize(source.data(), cache.data(), n, d, d, type, scales.data(), nullptr);
+    std::vector<float> scores(m * score_stride, sentinel), output(m * output_stride, sentinel);
+    MlasKVQuantInternal::DecodedGemmWorkspace workspace;
+    MlasKVQuantInternal::PrepareDecodedQuery(m, d, query.data(), query_stride, workspace);
+    MlasKVQuantInternal::DecodedQKGemm(
+        m, n, d, 0.125f, cache.data(), type, scales.data(), scores.data(), score_stride, workspace);
+    const auto* query_storage = workspace.query.data();
+    const auto* decoded_storage = workspace.decoded.data();
+    MlasKVQuantInternal::DecodedSVGemm(
+        m, d, n, scores.data(), score_stride, cache.data(), type, scales.data(),
+        output.data(), output_stride, 0.0f, workspace);
+    EXPECT_EQ(workspace.query.data(), query_storage);
+    EXPECT_EQ(workspace.decoded.data(), decoded_storage);
+    for (size_t row = 0; row < m; ++row) {
+      for (size_t col = d; col < output_stride; ++col) {
+        EXPECT_EQ(output[row * output_stride + col], sentinel);
+      }
+      for (size_t col = n; col < score_stride; ++col) {
+        EXPECT_EQ(scores[row * score_stride + col], sentinel);
+      }
+    }
+    MlasKVQuantInternal::PrepareDecodedQuery(m / 2, d, query.data(), query_stride, workspace);
+    MlasKVQuantInternal::DecodedQKGemm(
+        m / 2, n / 2, d, 0.125f, cache.data(), type, scales.data(), scores.data(), score_stride, workspace);
+    EXPECT_EQ(workspace.query.data(), query_storage);
+    EXPECT_EQ(workspace.decoded.data(), decoded_storage);
+    std::vector<float> float_query(m * query_stride, 0.25f);
+    MlasKVQuantInternal::PrepareDecodedQuery(m, d, float_query.data(), query_stride, workspace);
+    EXPECT_EQ(workspace.prepared_query, float_query.data());
+    EXPECT_EQ(workspace.query_stride, query_stride);
+    EXPECT_EQ(workspace.query.data(), query_storage);
+    EXPECT_THROW(MlasKVQuantInternal::PrepareDecodedQuery(m, d, query.data(), d - 1, workspace),
+                 std::exception);
+  }
+}
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_RejectsInvalidMetadata) {
+  for (bool e5m2 : {false, true}) {
+    RunFp8KvDecodeTest(e5m2, true, false, true);
+    RunFp8KvDecodeTest(e5m2, false, true, true);
+  }
+}
+
+void RunFp8FlashDecodingTest(bool half_compute) {
+  constexpr size_t d = 128, total = 53, capacity = 57, block = 11, chunks = (total + block - 1) / block;
+  constexpr size_t guard = 17, scratch_count = 2 + block + d;
+  constexpr float sentinel = -1234.0f;
+  for (bool e5m2 : {false, true}) {
+    const auto type = Fp8KvMlasType(e5m2, half_compute);
+    if (!MlasIsKVQuantGemmSupported(type)) GTEST_SKIP() << "Requested FP8 arithmetic is not available";
+    std::vector<float> query(d), scales(d), key(capacity * d), value(key.size()), bias(total);
+    std::vector<uint8_t> key_cache(key.size()), value_cache(value.size());
+    for (size_t col = 0; col < d; ++col) {
+      query[col] = static_cast<float>(static_cast<int>(col % 19) - 9) / 32.0f;
+      scales[col] = 0.013f + 0.003f * static_cast<float>(col % 7);
+    }
+    for (size_t i = 0; i < key.size(); ++i) {
+      key[i] = static_cast<float>(static_cast<int>(i % 31) - 15) / 32.0f;
+      value[i] = static_cast<float>(static_cast<int>(i % 47) - 23) / 32.0f;
+    }
+    MlasKVQuantize(key.data(), key_cache.data(), capacity, d, d, type, scales.data(), nullptr);
+    MlasKVQuantize(value.data(), value_cache.data(), capacity, d, d, type, scales.data(), nullptr);
+    for (size_t i = 0; i < total; ++i) bias[i] = i % 9 == 0 ? -10000.0f : 0.125f;
+    std::vector<MLFloat16> half_query(d), half_bias(total);
+    std::transform(query.begin(), query.end(), half_query.begin(), [](float v) { return MLFloat16(v); });
+    std::transform(bias.begin(), bias.end(), half_bias.begin(), [](float v) { return MLFloat16(v); });
+    for (bool fp16 : {false, true}) {
+      for (int window : {-1, 5}) {
+        SCOPED_TRACE(testing::Message() << e5m2 << "," << fp16 << "," << window);
+        std::vector<float> reference(d), output(d + 2 * guard, sentinel);
+        std::vector<MLFloat16> reference_half(d), output_half(output.size(), MLFloat16(sentinel));
+        std::vector<float> scratch(3 * scratch_count + 2 * guard, sentinel);
+        std::vector<float> partials(chunks * (2 + d) + 2 * guard, sentinel);
+        MlasFlashAttentionQuantizedKVArgs args;
+        args.batch_size = args.num_heads = args.kv_num_heads = args.sequence_length = args.q_block_size = 1;
+        args.total_seqlen = total;
+        args.head_size = d;
+        args.past_seqlen = total - 1;
+        args.seqlen_present_kv = capacity;
+        args.kv_block_size = block;
+        args.local_window_size = window;
+        args.scale = 0.125f;
+        args.quant_type = type;
+        args.per_channel_k = args.per_channel_v = true;
+        args.query = fp16 ? nullptr : query.data();
+        args.query_fp16 = fp16 ? half_query.data() : nullptr;
+        args.q_batch_stride = d;
+        args.k_cache = key_cache.data();
+        args.v_cache = value_cache.data();
+        args.k_scale = args.v_scale = scales.data();
+        args.attention_bias = fp16 ? nullptr : bias.data();
+        args.attention_bias_fp16 = fp16 ? half_bias.data() : nullptr;
+        args.attention_bias_seqlen_stride = total;
+        args.buffer = scratch.data() + guard;
+        args.buffer_size_per_thread = scratch_count * sizeof(float);
+        args.output = fp16 ? nullptr : reference.data();
+        args.output_fp16 = fp16 ? reference_half.data() : nullptr;
+        MlasFlashAttentionQuantizedKV(&args, nullptr);
+        args.thread_count = 3;
+        args.flash_decoding_partials = partials.data() + guard;
+        args.kv_chunk_count = chunks;
+        args.output = fp16 ? nullptr : output.data() + guard;
+        args.output_fp16 = fp16 ? output_half.data() + guard : nullptr;
+        MlasFlashAttentionQuantizedKV(&args, nullptr);
+        for (size_t col = 0; col < d; ++col) {
+          const float expected = fp16 ? reference_half[col].ToFloat() : reference[col];
+          const float actual = fp16 ? output_half[guard + col].ToFloat() : output[guard + col];
+          ASSERT_NEAR(actual, expected, half_compute || fp16 ? 0.001f : 0.00002f);
+        }
+        for (size_t i = 0; i < guard; ++i) {
+          ASSERT_EQ(scratch[i], sentinel);
+          ASSERT_EQ(scratch[guard + 3 * scratch_count + i], sentinel);
+          ASSERT_EQ(partials[i], sentinel);
+          ASSERT_EQ(partials[guard + chunks * (2 + d) + i], sentinel);
+          ASSERT_EQ(output[i], sentinel);
+          ASSERT_EQ(output[guard + d + i], sentinel);
+          ASSERT_EQ(output_half[i].val, MLFloat16(sentinel).val);
+          ASSERT_EQ(output_half[guard + d + i].val, MLFloat16(sentinel).val);
+        }
+      }
+    }
+  }
+}
 #endif
+
+TEST(GroupQueryAttentionTest, Fp8HalfKV_FlashDecodingAndMaskedChunks) {
+#if !defined(DISABLE_FLOAT8_TYPES)
+  RunFp8FlashDecodingTest(true);
+#else
+  GTEST_SKIP() << "FP8 types are disabled";
+#endif
+}
+
+TEST(GroupQueryAttentionTest, Fp8KV_FlashDecodingAndMaskedChunks) {
+#if !defined(DISABLE_FLOAT8_TYPES)
+  RunFp8FlashDecodingTest(false);
+#else
+  GTEST_SKIP() << "FP8 types are disabled";
+#endif
+}
+
+TEST(GroupQueryAttentionBenchmark, DISABLED_QuantizedKVFlashTiles) {
+  constexpr size_t d = 128, total = 4096, heads = 3;
+  std::vector<float> scales(d, 0.01f), key(total * d), value(key.size());
+  for (size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<float>(static_cast<int>(i % 31) - 15) / 32.0f;
+    value[i] = static_cast<float>(static_cast<int>((i * 7) % 47) - 23) / 32.0f;
+  }
+  for (auto type : {MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel_Fp16,
+                    MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel,
+                    MLAS_KV_QUANT_TYPE::S8_PerChannel_Native}) {
+    if (!MlasIsKVQuantGemmSupported(type)) GTEST_SKIP() << "Quantized KV mode is not supported";
+    std::vector<uint8_t> key_cache(key.size()), value_cache(value.size());
+    MlasKVQuantize(key.data(), key_cache.data(), total, d, d, type, scales.data(), nullptr);
+    MlasKVQuantize(value.data(), value_cache.data(), total, d, d, type, scales.data(), nullptr);
+    for (int rows : {8, 128}) {
+      std::vector<MLFloat16> query(heads * rows * d), output(query.size());
+      for (size_t i = 0; i < query.size(); ++i) {
+        query[i] = MLFloat16(static_cast<float>(static_cast<int>(i % 19) - 9) / 32.0f);
+      }
+      for (int block : {128, 256, 512, 1024, 3072}) {
+        std::vector<float> scratch(static_cast<size_t>(rows) * (2 + block + d));
+        MlasFlashAttentionQuantizedKVArgs args;
+        args.batch_size = args.kv_num_heads = 1;
+        args.num_heads = heads;
+        args.sequence_length = args.q_block_size = rows;
+        args.total_seqlen = args.seqlen_present_kv = total;
+        args.head_size = d;
+        args.past_seqlen = total - rows;
+        args.kv_block_size = block;
+        args.scale = 1.0f / std::sqrt(static_cast<float>(d));
+        args.quant_type = type;
+        args.per_channel_k = args.per_channel_v = true;
+        args.query_fp16 = query.data();
+        args.q_batch_stride = query.size();
+        args.k_cache = key_cache.data();
+        args.v_cache = value_cache.data();
+        args.k_scale = args.v_scale = scales.data();
+        args.output_fp16 = output.data();
+        args.buffer = scratch.data();
+        args.buffer_size_per_thread = scratch.size() * sizeof(float);
+        for (int i = 0; i < 3; ++i) MlasFlashAttentionQuantizedKV(&args, nullptr);
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) MlasFlashAttentionQuantizedKV(&args, nullptr);
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - start).count() / 10;
+        double checksum = 0;
+        for (auto element : output) {
+          ASSERT_TRUE(std::isfinite(element.ToFloat()));
+          checksum += element.ToFloat();
+        }
+        std::cout << "quantized_flash_tile," << static_cast<int>(type) << ',' << rows << ',' << block << ','
+                  << us << ',' << checksum << '\n';
+      }
+    }
+  }
+}
+
+void RunNativeInt4MlasTest(size_t m, size_t n, size_t d, bool signed_scores = false) {
+  constexpr auto type = MLAS_KV_QUANT_TYPE::S4_PerChannel_Native;
+  if (!MlasIsKVQuantGemmSupported(type)) GTEST_SKIP() << "Native INT4 integer GEMM is not available";
+  SCOPED_TRACE(testing::Message() << "M=" << m << ",N=" << n << ",D=" << d << ",signed=" << signed_scores);
+  const size_t lda = d + 3, lds = n + 3, ldc = n + 2, ldo = d + 2, stride = (d + 1) / 2;
+  constexpr float sentinel = -99.0f, alpha = 0.125f;
+  std::vector<float> query(m * lda, sentinel), scores(m * lds, sentinel), ks(d), vs(d);
+  std::vector<MLFloat16> query_half(query.size());
+  std::vector<uint8_t> key(n * stride + 2, 0xa5), value(key.size(), 0xa5);
+  for (size_t i = 0; i < n * stride; ++i) {
+    key[i + 1] = PackInt4(static_cast<int8_t>(static_cast<int>(i * 3 % 16) - 8),
+                         static_cast<int8_t>(static_cast<int>((i * 7 + 1) % 16) - 8));
+    value[i + 1] = PackInt4(static_cast<int8_t>(static_cast<int>((i * 5 + 1) % 16) - 8),
+                           static_cast<int8_t>(static_cast<int>((i * 11 + 3) % 16) - 8));
+  }
+  for (size_t col = 0; col < d; ++col) {
+    ks[col] = 0.013f + 0.003f * static_cast<float>(col % 7);
+    vs[col] = 0.017f + 0.002f * static_cast<float>(col % 11);
+  }
+  for (size_t row = 0; row < m; ++row) {
+    const bool zero_row = m > 1 && row + 1 == m;
+    for (size_t col = 0; col < d; ++col) {
+      query[row * lda + col] = zero_row ? 0.0f : 0.03125f * static_cast<float>(static_cast<int>((row * 3 + col) % 17) - 8);
+    }
+    for (size_t col = 0; col < n; ++col) {
+      const int code = static_cast<int>((row * 3 + col) % 13) + (signed_scores ? -6 : 1);
+      scores[row * lds + col] = zero_row ? 0.0f : 0.015625f * static_cast<float>(code);
+    }
+  }
+  std::transform(query.begin(), query.end(), query_half.begin(), [](float x) { return MLFloat16(x); });
+  const auto unpack = [stride](const std::vector<uint8_t>& cache, size_t row, size_t col) {
+    const auto pair = UnpackInt4(cache[1 + row * stride + col / 2]);
+    return col % 2 == 0 ? pair.first : pair.second;
+  };
+  std::vector<float> qk(m * ldc, sentinel), qk_half(qk.size(), sentinel), reused(qk.size(), sentinel);
+  MlasQKGemm(m, n, d, alpha, query.data(), lda, key.data() + 1, type, ks.data(), qk.data(), ldc, nullptr);
+  MlasQKGemmFp16(m, n, d, alpha, query_half.data(), lda, key.data() + 1, type, ks.data(), qk_half.data(), ldc, nullptr);
+  MlasKVQuantInternal::NativeInt4Workspace workspace;
+  MlasKVQuantInternal::PrepareNativeInt4Query(m, d, query.data(), lda, ks.data(), workspace);
+  MlasKVQuantInternal::NativeInt4QKGemm(m, n, d, alpha, key.data() + 1, reused.data(), ldc, workspace);
+  for (size_t row = 0; row < m; ++row) {
+    float row_peak = 0.0f;
+    for (size_t k = 0; k < d; ++k) row_peak = std::max(row_peak, std::abs(query[row * lda + k] * ks[k]));
+    for (size_t col = 0; col < n; ++col) {
+      double expected = 0.0, tolerance = 0.00001;
+      for (size_t offset = 0; offset < d; offset += 128) {
+        float magnitude = 0.0f;
+        for (size_t k = offset; k < std::min(d, offset + 128); ++k) {
+          const float a = query[row * lda + k] * ks[k];
+          const float b = static_cast<float>(unpack(key, col, k));
+          expected += static_cast<double>(a) * b * alpha;
+          magnitude += std::abs(b);
+        }
+        tolerance += 0.51 * row_peak / 127.0 * magnitude * alpha;
+      }
+      ASSERT_NEAR(qk[row * ldc + col], expected, tolerance);
+      ASSERT_EQ(qk_half[row * ldc + col], qk[row * ldc + col]);
+      ASSERT_EQ(reused[row * ldc + col], qk[row * ldc + col]);
+    }
+    for (size_t col = n; col < ldc; ++col) {
+      EXPECT_EQ(qk[row * ldc + col], sentinel);
+      EXPECT_EQ(qk_half[row * ldc + col], sentinel);
+      EXPECT_EQ(reused[row * ldc + col], sentinel);
+    }
+  }
+  for (float beta : {0.0f, 0.5f, 1.0f}) {
+    std::vector<float> output(m * ldo, sentinel);
+    std::vector<MLFloat16> output_half(output.size(), MLFloat16(sentinel));
+    for (size_t row = 0; row < m; ++row) {
+      for (size_t col = 0; col < d; ++col) {
+        output[row * ldo + col] = beta == 0.0f ? std::numeric_limits<float>::quiet_NaN() : 0.25f;
+        output_half[row * ldo + col] = MLFloat16(output[row * ldo + col]);
+      }
+    }
+    MlasKVQuantInternal::NativeInt4SVGemm(m, d, n, scores.data(), lds, value.data() + 1, vs.data(),
+                                         output.data(), ldo, beta, workspace);
+    MlasSVGemmFp16(m, d, n, scores.data(), lds, value.data() + 1, type, vs.data(),
+                   output_half.data(), ldo, beta, nullptr);
+    for (size_t row = 0; row < m; ++row) {
+      float row_peak = 0.0f;
+      for (size_t k = 0; k < n; ++k) row_peak = std::max(row_peak, std::abs(scores[row * lds + k]));
+      const float limit = !signed_scores && MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S8_PerChannel_Native)
+                              ? 255.0f : 127.0f;
+      for (size_t col = 0; col < d; ++col) {
+        double expected = beta * 0.25, tolerance = 0.00001;
+        for (size_t offset = 0; offset < n; offset += 128) {
+          float magnitude = 0.0f;
+          for (size_t k = offset; k < std::min(n, offset + 128); ++k) {
+            const float a = scores[row * lds + k];
+            const float b = static_cast<float>(unpack(value, k, col)) * vs[col];
+            expected += static_cast<double>(a) * b;
+            magnitude += std::abs(b);
+          }
+          tolerance += 0.51 * row_peak / limit * magnitude;
+        }
+        ASSERT_NEAR(output[row * ldo + col], expected, tolerance);
+        ASSERT_EQ(output_half[row * ldo + col].val, MLFloat16(output[row * ldo + col]).val);
+      }
+      for (size_t col = d; col < ldo; ++col) {
+        EXPECT_EQ(output[row * ldo + col], sentinel);
+        EXPECT_EQ(output_half[row * ldo + col].val, MLFloat16(sentinel).val);
+      }
+    }
+    MlasKVQuantInternal::NativeInt4QKGemm(m, n, d, alpha, key.data() + 1, reused.data(), ldc, workspace);
+    EXPECT_EQ(reused, qk);
+  }
+  EXPECT_EQ(key.front(), 0xa5);
+  EXPECT_EQ(key.back(), 0xa5);
+  EXPECT_EQ(value.front(), 0xa5);
+  EXPECT_EQ(value.back(), 0xa5);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasSingleRowTails) {
+  RunNativeInt4MlasTest(1, 37, 7);
+  RunNativeInt4MlasTest(1, 129, 1);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasEightRowsAndBlockTails) {
+  RunNativeInt4MlasTest(8, 529, 131);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasPrefill128) {
+  RunNativeInt4MlasTest(128, 641, 128);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_MlasSignedAndZeroRows) {
+  RunNativeInt4MlasTest(8, 257, 128, true);
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_CodecAndInvalidInputs) {
+  constexpr auto type = MLAS_KV_QUANT_TYPE::S4_PerChannel_Native;
+  if (!MlasIsKVQuantGemmSupported(type)) GTEST_SKIP() << "Native INT4 integer GEMM is not available";
+  std::vector<float> source(64), scales(8), input(8, 1.0f), output(8);
+  std::vector<MLFloat16> half(source.size());
+  for (size_t i = 0; i < source.size(); ++i) {
+    source[i] = 0.125f * static_cast<float>(static_cast<int>(i % 31) - 15);
+    half[i] = MLFloat16(source[i]);
+  }
+  for (size_t i = 0; i < scales.size(); ++i) scales[i] = 0.125f + 0.0625f * static_cast<float>(i % 3);
+  std::vector<uint8_t> native(34, 0xa5), legacy(native), from_half(native);
+  MlasKVQuantize(source.data(), native.data() + 1, 8, 8, 8, type, scales.data(), nullptr);
+  MlasKVQuantize(source.data(), legacy.data() + 1, 8, 8, 8, MLAS_KV_QUANT_TYPE::S4_PerChannel, scales.data(), nullptr);
+  MlasKVQuantizeFp16(half.data(), from_half.data() + 1, 8, 8, 8, type, scales.data(), nullptr);
+  EXPECT_EQ(native, legacy);
+  EXPECT_EQ(native, from_half);
+  EXPECT_EQ(native.front(), 0xa5);
+  EXPECT_EQ(native.back(), 0xa5);
+  EXPECT_EQ(MlasKVQuantPackedRowBytes(type, 7), size_t{4});
+  for (float invalid : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+    auto bad = scales;
+    bad[3] = invalid;
+    EXPECT_THROW(MlasQKGemm(1, 8, 8, 1.0f, input.data(), 8, native.data() + 1, type, bad.data(),
+                            output.data(), 8, nullptr), OnnxRuntimeException);
+    EXPECT_THROW(MlasSVGemm(1, 8, 8, input.data(), 8, native.data() + 1, type, bad.data(),
+                            output.data(), 8, 0.0f, nullptr), OnnxRuntimeException);
+  }
+  for (float invalid : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()}) {
+    input[3] = invalid;
+    EXPECT_THROW(MlasQKGemm(1, 8, 8, 1.0f, input.data(), 8, native.data() + 1, type, scales.data(),
+                            output.data(), 8, nullptr), OnnxRuntimeException);
+    EXPECT_THROW(MlasSVGemm(1, 8, 8, input.data(), 8, native.data() + 1, type, scales.data(),
+                            output.data(), 8, 0.0f, nullptr), OnnxRuntimeException);
+  }
+  std::fill(output.begin(), output.end(), 0.25f);
+  MlasSVGemm(1, 8, 0, nullptr, 0, nullptr, type, nullptr, output.data(), 8, 0.5f, nullptr);
+  EXPECT_EQ(output, std::vector<float>(8, 0.125f));
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_GqaRejectsInvalidMetadata) {
+  if (!MlasIsKVQuantGemmSupported(MLAS_KV_QUANT_TYPE::S4_PerChannel_Native)) {
+    GTEST_SKIP() << "Native INT4 integer GEMM is not available";
+  }
+  for (int issue = 0; issue < 5; ++issue) {
+    SCOPED_TRACE(issue);
+    const int bits = issue == 3 ? 8 : 4, width = bits == 4 ? 4 : 8;
+    OpTester tester("GroupQueryAttention", 1, onnxruntime::kMSDomain);
+    tester.AddAttribute<int64_t>("num_heads", 1);
+    tester.AddAttribute<int64_t>("kv_num_heads", 1);
+    tester.AddAttribute<int64_t>("kv_cache_bit_width", bits);
+    tester.AddAttribute<std::string>("k_quant_type", "PER_CHANNEL_INT4_NATIVE");
+    tester.AddAttribute<std::string>("v_quant_type", issue == 4 ? "PER_CHANNEL_INT8_NATIVE" : "PER_CHANNEL_INT4_NATIVE");
+    for (const auto* name : {"query", "key", "value"}) {
+      tester.AddInput<MLFloat16>(name, {1, 1, 8}, std::vector<MLFloat16>(8, MLFloat16(0.0f)));
+    }
+    for (const auto* name : {"past_key", "past_value"}) {
+      if (issue == 2) {
+        tester.AddInput<int8_t>(name, {1, 1, 1, width}, std::vector<int8_t>(width, -120));
+      } else {
+        tester.AddInput<uint8_t>(name, {1, 1, 1, width}, std::vector<uint8_t>(width, 0x88));
+      }
+    }
+    tester.AddInput<int32_t>("seqlens_k", {1}, {0});
+    tester.AddInput<int32_t>("total_sequence_length", {1}, {1});
+    tester.AddOptionalInputEdge<MLFloat16>();
+    tester.AddOptionalInputEdge<MLFloat16>();
+    tester.AddOptionalInputEdge<int64_t>();
+    tester.AddOptionalInputEdge<MLFloat16>();
+    tester.AddOptionalInputEdge<MLFloat16>();
+    std::vector<float> scales(8, 1.0f);
+    if (issue == 0) scales[3] = 0.0f;
+    if (issue == 1) scales[3] = std::numeric_limits<float>::quiet_NaN();
+    tester.AddInput<float>("k_scale", {8}, scales);
+    tester.AddInput<float>("v_scale", {8}, scales);
+    tester.AddOutput<MLFloat16>("output", {1, 1, 8}, std::vector<MLFloat16>(8, MLFloat16(0.0f)));
+    for (const auto* name : {"present_key", "present_value"}) {
+      if (issue == 2) {
+        tester.AddOutput<int8_t>(name, {1, 1, 1, width}, std::vector<int8_t>(width, -120));
+      } else {
+        tester.AddOutput<uint8_t>(name, {1, 1, 1, width}, std::vector<uint8_t>(width, 0x88));
+      }
+    }
+    const char* error = issue < 2 ? "Native INT4 KV scales must be finite and positive"
+                      : issue == 2 ? "Native INT4 KV requires packed uint8 storage"
+                                   : "CPU PER_CHANNEL_INT4_NATIVE requires matching K/V types";
+    std::vector<std::unique_ptr<IExecutionProvider>> providers;
+    providers.push_back(DefaultCpuExecutionProvider());
+    tester.Run(OpTester::ExpectResult::kExpectFailure, error, {}, nullptr, &providers);
+  }
+}
+
+TEST(GroupQueryAttentionTest, NativeInt4KV_QNBitPackingContract) {
+  constexpr size_t block = 128, n = 37, output_stride = n + 3;
+  if (!MlasIsQNBitGemmAvailable(4, block, SQNBIT_CompInt8)) {
+    GTEST_SKIP() << "Native INT4 integer GEMM is not available";
+  }
+  for (size_t k : {size_t{7}, size_t{128}, size_t{131}}) {
+    for (size_t m : {size_t{1}, size_t{8}, size_t{128}}) {
+      SCOPED_TRACE(testing::Message() << "M=" << m << ",K=" << k);
+      const size_t blocks = (k + block - 1) / block;
+      const size_t packed_stride = blocks * block / 2, cache_stride = (k + 1) / 2, lda = k + 3;
+      std::vector<float> a(m * lda, -1234.0f), source(n * k), cache_scales(k, 1.0f), scales(n * blocks);
+      for (size_t row = 0; row < m; ++row) {
+        for (size_t col = 0; col < k; ++col) {
+          a[row * lda + col] = static_cast<float>(static_cast<int>((row * 3 + col) % 15) - 7) * 0.125f;
+        }
+      }
+      for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<float>(static_cast<int>((i * 13 + 3) % 16) - 8);
+      }
+      for (size_t i = 0; i < scales.size(); ++i) scales[i] = 0.02f * static_cast<float>(1 + i % 7);
+      std::vector<uint8_t> cache(n * cache_stride + 2, 0xa5), blocked(n * packed_stride, 0x88);
+      MlasKVQuantize(source.data(), cache.data() + 1, n, k, k, MLAS_KV_QUANT_TYPE::S4_PerChannel,
+                     cache_scales.data(), nullptr);
+      for (size_t row = 0; row < n; ++row) {
+        std::copy_n(cache.data() + 1 + row * cache_stride, cache_stride, blocked.data() + row * packed_stride);
+        if (k % 2 != 0) blocked[row * packed_stride + cache_stride - 1] |= 0x80;
+      }
+      const size_t alignment = MlasGetPreferredBufferAlignment();
+      const size_t pack_size = MlasQNBitGemmPackQuantBDataSize(n, k, 4, block, false, SQNBIT_CompInt8, nullptr);
+      std::vector<uint8_t> pack_storage(pack_size + alignment, 0);
+      void* packed = pack_storage.data();
+      size_t pack_space = pack_storage.size();
+      if (pack_size != 0) {
+        ASSERT_NE(std::align(alignment, pack_size, packed, pack_space), nullptr);
+        MlasQNBitGemmPackQuantBData(n, k, 4, block, SQNBIT_CompInt8, blocked.data(), packed,
+                                    scales.data(), false, nullptr, nullptr, nullptr);
+        bool finalize = MlasQNBitGemmScalesPacked(k, 4, block, SQNBIT_CompInt8, false, nullptr);
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+        finalize = true;
+#endif
+        if (finalize) {
+          MlasQNBitGemmPackQuantBData(n, k, 4, block, SQNBIT_CompInt8, nullptr, packed,
+                                      scales.data(), false, nullptr, nullptr, nullptr);
+        }
+      }
+      const size_t workspace_size = MlasQNBitGemmBatchWorkspaceSize(m, n, k, 1, 4, block, false,
+                                                                   SQNBIT_CompInt8, nullptr);
+      std::vector<uint8_t> workspace_storage(workspace_size + alignment, 0);
+      void* workspace = workspace_size == 0 ? nullptr : workspace_storage.data();
+      size_t workspace_space = workspace_storage.size();
+      if (workspace != nullptr) ASSERT_NE(std::align(alignment, workspace_size, workspace, workspace_space), nullptr);
+      std::vector<float> output(m * output_stride, -1234.0f);
+      MLAS_QNBIT_GEMM_DATA_PARAMS<float> parameters{};
+      parameters.A = a.data();
+      parameters.lda = lda;
+      parameters.QuantBDataWorkspace = pack_size == 0 ? blocked.data() : packed;
+      parameters.PackedQuantBData = static_cast<const std::byte*>(parameters.QuantBDataWorkspace);
+      parameters.QuantBScale = scales.data();
+      parameters.C = output.data();
+      parameters.ldc = output_stride;
+      MlasQNBitGemmBatch(m, n, k, 1, 4, block, SQNBIT_CompInt8, &parameters, workspace, nullptr, nullptr);
+      for (size_t row = 0; row < m; ++row) {
+        for (size_t col = 0; col < n; ++col) {
+          double expected = 0.0, tolerance = 0.0001;
+          for (size_t offset = 0; offset < k; offset += block) {
+            const size_t count = std::min(block, k - offset);
+            float peak = 0.0f, magnitude = 0.0f;
+            for (size_t i = 0; i < count; ++i) {
+              const float av = a[row * lda + offset + i];
+              const float bv = source[col * k + offset + i] * scales[col * blocks + offset / block];
+              expected += static_cast<double>(av) * bv;
+              peak = std::max(peak, std::abs(av));
+              magnitude += std::abs(bv);
+            }
+            tolerance += 0.51 * peak / 127.0 * magnitude;
+          }
+          ASSERT_NEAR(output[row * output_stride + col], expected, tolerance);
+        }
+        for (size_t col = n; col < output_stride; ++col) EXPECT_EQ(output[row * output_stride + col], -1234.0f);
+      }
+      EXPECT_EQ(cache.front(), 0xa5);
+      EXPECT_EQ(cache.back(), 0xa5);
+    }
+  }
+}
+
+TEST(GroupQueryAttentionBenchmark, DISABLED_Fp32SubnormalGemm) {
+#if defined(_M_ARM64)
+  struct FpcrRestore {
+    __int64 value = _ReadStatusReg(ARM64_FPCR);
+    ~FpcrRestore() { _WriteStatusReg(ARM64_FPCR, value); }
+  } restore;
+  constexpr size_t m = 128, n = 128, k = 1024;
+  std::vector<float> a(m * k), b(k * n, 0.5f), c(m * n);
+  std::cout << "original_fpcr," << restore.value << '\n';
+  for (bool flush : {false, true}) {
+    const auto normal_mode = restore.value & ~(int64_t{1} << 24);
+    _WriteStatusReg(ARM64_FPCR, flush ? normal_mode | (int64_t{1} << 24) : normal_mode);
+    for (float value : {0.125f, 1.0e-40f}) {
+      std::fill(a.begin(), a.end(), value);
+      const auto compute = [&]() {
+        MlasGemm(CblasNoTrans, CblasNoTrans, m, n, k, 1.0f, a.data(), k, b.data(), n,
+                 0.0f, c.data(), n, nullptr, nullptr);
+      };
+      for (int i = 0; i < 3; ++i) compute();
+      const auto start = std::chrono::steady_clock::now();
+      for (int i = 0; i < 32; ++i) compute();
+      const double us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - start).count() / 32;
+      std::cout << "fp32_subnormal_gemm," << flush << ',' << value << ',' << us << ',' << c.front() << '\n';
+    }
+  }
+#else
+  GTEST_SKIP() << "This diagnostic probes the Windows ARM64 FPCR";
+#endif
+}
+
+TEST(GroupQueryAttentionBenchmark, DISABLED_HalfGemmTileBackends) {
+  if (!MlasHGemmSupported(CblasNoTrans, CblasTrans) || !MlasHGemmSupported(CblasNoTrans, CblasNoTrans) ||
+      MlasHalfGemmPackBSize(128, 128, false) == 0) {
+    GTEST_SKIP() << "Accelerated half GEMMs are not available";
+  }
+  std::cout << "half_gemm_l2_bytes," << Env::Default().GetL2CacheSize() << '\n';
+  for (size_t m : {size_t{1}, size_t{8}, size_t{128}}) {
+    for (size_t tokens : {size_t{256}, size_t{1024}}) {
+      for (bool qk : {true, false}) {
+        const size_t n = qk ? tokens : 128;
+        const size_t k = qk ? 128 : tokens;
+        std::vector<MLFloat16> a(m * k), b(n * k), transposed_b(b.size()), c(m * n);
+        for (size_t i = 0; i < a.size(); ++i) {
+          a[i] = MLFloat16(static_cast<float>(static_cast<int>(i % 31) - 15) / 32.0f);
+        }
+        for (size_t i = 0; i < b.size(); ++i) {
+          b[i] = MLFloat16(static_cast<float>(static_cast<int>(i % 37) - 18) / 32.0f);
+        }
+        MLAS_HALF_GEMM_DATA_PARAMS data;
+        data.A = a.data();
+        data.B = qk ? transposed_b.data() : b.data();
+        data.C = c.data();
+        data.lda = k;
+        data.ldb = data.ldc = n;
+        for (bool batched : {false, true}) {
+          const auto compute = [&]() {
+            if (batched) {
+              if (qk) MlasTranspose(b.data(), transposed_b.data(), n, k, nullptr);
+              MlasHalfGemmBatch(m, n, k, 1, &data, nullptr);
+            } else {
+              MlasGemm(CblasNoTrans, qk ? CblasTrans : CblasNoTrans, m, n, k, a.data(), k, b.data(),
+                       qk ? k : n, c.data(), n, MLFloat16(1.0f).val, uint16_t{0}, nullptr);
+            }
+          };
+          for (size_t i = 0; i < 3; ++i) compute();
+          const size_t repeats = m == 128 ? 32 : 128;
+          const auto start = std::chrono::steady_clock::now();
+          for (size_t i = 0; i < repeats; ++i) compute();
+          const double us = std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - start).count() / repeats;
+          ASSERT_TRUE(std::all_of(c.begin(), c.end(), [](MLFloat16 v) { return std::isfinite(v.ToFloat()); }));
+          std::cout << "half_gemm_tile," << m << ',' << n << ',' << k << ',' << (qk ? "QK" : "SV")
+                    << ',' << (batched ? "HalfGemmBatch" : "HGemm") << ',' << us << '\n';
+        }
+      }
+    }
+  }
+}
 
 }  // namespace test
 }  // namespace onnxruntime

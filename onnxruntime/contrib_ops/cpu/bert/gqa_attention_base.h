@@ -107,7 +107,9 @@ class GQAAttentionBase {
     const auto k_quant_type = info.GetAttrOrDefault<std::string>("k_quant_type", "NONE");
     const auto v_quant_type = info.GetAttrOrDefault<std::string>("v_quant_type", "NONE");
     kv_cache_bit_width_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("kv_cache_bit_width", 0));
-    kv_cache_is_fp8_ = k_quant_type == "FP8E4M3FN_PER_CHANNEL" || k_quant_type == "FP8E5M2_PER_CHANNEL";
+    const bool fp8_half = k_quant_type == "FP8E4M3FN_PER_CHANNEL_FP16" ||
+                          k_quant_type == "FP8E5M2_PER_CHANNEL_FP16";
+    kv_cache_is_fp8_ = fp8_half || k_quant_type == "FP8E4M3FN_PER_CHANNEL" || k_quant_type == "FP8E5M2_PER_CHANNEL";
     if (k_quant_type == "PER_CHANNEL_INT8_NATIVE") {
       ORT_ENFORCE(k_quant_type == v_quant_type && kv_cache_bit_width_ == 8,
                   "CPU PER_CHANNEL_INT8_NATIVE requires matching K/V types and kv_cache_bit_width=8");
@@ -115,6 +117,13 @@ class GQAAttentionBase {
       mlas_kv_quant_type_ = MLAS_KV_QUANT_TYPE::S8_PerChannel_Native;
       ORT_ENFORCE(MlasIsKVQuantGemmSupported(mlas_kv_quant_type_),
                   "PER_CHANNEL_INT8_NATIVE requires ARM64 integer GEMM support");
+    } else if (k_quant_type == "PER_CHANNEL_INT4_NATIVE") {
+      ORT_ENFORCE(k_quant_type == v_quant_type && kv_cache_bit_width_ == 4,
+                  "CPU PER_CHANNEL_INT4_NATIVE requires matching K/V types and kv_cache_bit_width=4");
+      k_quant_type_ = v_quant_type_ = KVQuantizationType::PER_CHANNEL;
+      mlas_kv_quant_type_ = MLAS_KV_QUANT_TYPE::S4_PerChannel_Native;
+      ORT_ENFORCE(MlasIsKVQuantGemmSupported(mlas_kv_quant_type_),
+                  "PER_CHANNEL_INT4_NATIVE requires integer GEMM support");
     } else if (k_quant_type == "PER_CHANNEL_GEMM") {
       ORT_ENFORCE(k_quant_type == v_quant_type && (kv_cache_bit_width_ == 4 || kv_cache_bit_width_ == 8),
                   "CPU PER_CHANNEL_GEMM KV requires matching K/V types and bit width 4 or 8");
@@ -126,10 +135,17 @@ class GQAAttentionBase {
       ORT_ENFORCE(k_quant_type == v_quant_type && kv_cache_bit_width_ == 8,
                   "CPU FP8 KV requires matching K/V formats and kv_cache_bit_width=8");
       k_quant_type_ = v_quant_type_ = KVQuantizationType::PER_CHANNEL;
-      mlas_kv_quant_type_ = k_quant_type == "FP8E4M3FN_PER_CHANNEL"
-                                ? MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel
-                                : MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel;
-      ORT_ENFORCE(MlasIsKVQuantGemmSupported(mlas_kv_quant_type_), "FP8 KV support is disabled in this build");
+      if (fp8_half) {
+        mlas_kv_quant_type_ = k_quant_type == "FP8E4M3FN_PER_CHANNEL_FP16"
+                                  ? MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel_Fp16
+                                  : MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel_Fp16;
+      } else {
+        mlas_kv_quant_type_ = k_quant_type == "FP8E4M3FN_PER_CHANNEL"
+                                  ? MLAS_KV_QUANT_TYPE::F8E4M3FN_PerChannel
+                                  : MLAS_KV_QUANT_TYPE::F8E5M2_PerChannel;
+      }
+      ORT_ENFORCE(MlasIsKVQuantGemmSupported(mlas_kv_quant_type_),
+                  "FP8 KV format or its requested arithmetic is not supported by this build and CPU");
     } else {
       k_quant_type_ = StringToKVQuantizationType(k_quant_type);
       v_quant_type_ = StringToKVQuantizationType(v_quant_type);
@@ -886,6 +902,10 @@ class GQAAttentionBase {
     //   Approximation: use same formula as FP32 flash attention
     int kv_block_size = block_sizes.kv_block_size;
     int q_block_size = block_sizes.q_block_size;
+    if (kv_cache_is_fp8_ || mlas_kv_quant_type_ == MLAS_KV_QUANT_TYPE::S4_PerChannel_Native) {
+      // Conversion/packing scratch is additional to the scores, and L2 may be shared by many workers.
+      kv_block_size = std::min(kv_block_size, 512);
+    }
 
     // The flash kernel uses a single (past_seqlen, total_seqlen) pair for all batch items.
     // When batch items have different seqlens_k (ragged), we must fall back to per-batch
