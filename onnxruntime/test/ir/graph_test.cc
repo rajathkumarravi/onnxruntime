@@ -322,19 +322,24 @@ TEST_F(GraphTest, SimpleAddDefaultDomain) {
   ASSERT_STATUS_OK(Model::Load(std::move(m), model, nullptr, *logger_));
 }
 
-#if !defined(DISABLE_CONTRIB_OPS) && !defined(DISABLE_FLOAT8_TYPES)
-TEST_F(GraphTest, EPContextPreservesFloat8WithMixedPrecisionIO) {
-  for (const int cache_type : {TensorProto_DataType_FLOAT8E4M3FN,
+#if !defined(DISABLE_CONTRIB_OPS)
+TEST_F(GraphTest, EPContextPreservesLowPrecisionWithMixedPrecisionIO) {
+  for (const int cache_type : {TensorProto_DataType_UINT4,
+                               TensorProto_DataType_INT4,
+#if !defined(DISABLE_FLOAT8_TYPES)
+                               TensorProto_DataType_FLOAT8E4M3FN,
                                TensorProto_DataType_FLOAT8E4M3FNUZ,
                                TensorProto_DataType_FLOAT8E5M2,
-                               TensorProto_DataType_FLOAT8E5M2FNUZ}) {
+                               TensorProto_DataType_FLOAT8E5M2FNUZ,
+#endif
+                              }) {
     SCOPED_TRACE(cache_type);
     ModelProto proto;
-    proto.set_ir_version(9);
+    proto.set_ir_version(10);
     ImportOpset(proto, "", 21);
     ImportOpset(proto, kMSDomain, 1);
     auto& graph = *proto.mutable_graph();
-    graph.set_name("float8_context");
+    graph.set_name("low_precision_context");
     auto add_port = [](ValueInfoProto* port, const char* name, int type, const std::vector<int64_t>& shape) {
       port->set_name(name);
       SetTypeAndShape(port->mutable_type()->mutable_tensor_type(), type, shape);
