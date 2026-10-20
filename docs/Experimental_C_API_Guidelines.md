@@ -82,8 +82,24 @@ Add test coverage for new experimental functions, exercising both the lookup mec
 1. **Add.** Add one experimental API entry with the current ORT API version and implement the function.
 2. **Update.** A backward-compatible fix or behavioral extension may retain the existing name. For a signature change or an incompatible ABI or behavioral-contract change, introduce a new experimental API entry at the current ORT API version — which produces a new lookup name — rather than modifying the existing one. The old and new entries may coexist. Never reuse a name.
 3. **Promote or remove.**
-   - **Promote:** Add the function to the stable API struct (append-only, dropping the `<TargetStruct>_` prefix and the `_SinceV<Version>` suffix from the name) and remove the experimental entry.
+   - **Promote:** Add the function to the stable API struct (append-only, dropping the `<TargetStruct>_` prefix and the `_SinceV<Version>` suffix from the name) and remove the experimental entry. An ABI-identical runtime redirect may be retained during a transition, as described in the [design](design/Experimental_C_API.md). This does not republish the experimental declarations or allow a name to be reused for a different contract.
    - **Remove:** Delete the experimental entry. Because the versioned name is unique and never reused, no separate retirement tracking is needed.
+
+### EPContext callback migration
+
+Non-minimal builds retain runtime redirects for the six EPContext callback APIs
+introduced with `_SinceV28` names and promoted to stable in ORT 1.31. These cover
+setting the read/write callbacks, obtaining/releasing the configuration snapshot,
+and retrieving its read/write callbacks. Existing EP binaries can therefore keep
+using their original typed lookups while migrating to the stable APIs.
+
+The redirects resolve to the stable implementations, with the same signatures,
+ownership rules and error handling. They do not restore experimental declarations
+to the public headers or promise compatibility for other removed experimental
+APIs. New builds of applications and EPs should use the stable `OrtApi`,
+`OrtCompileApi` and `OrtEpApi` members. Test a replacement runtime with the actual
+EP binary and model cache: successful library registration alone does not verify
+that the EP's required APIs are available.
 
 ## References
 

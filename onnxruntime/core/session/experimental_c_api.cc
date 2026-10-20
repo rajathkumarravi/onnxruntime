@@ -13,6 +13,11 @@
 #include "core/session/onnxruntime_experimental_c_api.h"
 #include "core/session/ort_apis.h"
 
+#if !defined(ORT_MINIMAL_BUILD)
+#include "core/session/compile_api.h"
+#include "core/session/plugin_ep/ep_api.h"
+#endif
+
 // ---------------------------------------------------------------------------
 // Experimental function implementations
 // ---------------------------------------------------------------------------
@@ -63,6 +68,23 @@ static const std::array kExperimentalFunctions{
 #include "onnxruntime_experimental_c_api.inc"
 
 #undef ORT_EXPERIMENTAL_API
+
+#if !defined(ORT_MINIMAL_BUILD)
+    // Retain ABI-identical v28 EPContext names for existing plugins after the v31
+    // promotion. New consumers should use the stable APIs, not these redirects.
+    ExperimentalEntry{"OrtApi_SessionOptions_SetEpContextDataReadFunc_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtApis::SessionOptionsSetEpContextDataReadFunc)},
+    ExperimentalEntry{"OrtCompileApi_ModelCompilationOptions_SetEpContextDataWriteFunc_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtCompileAPI::ModelCompilationOptions_SetEpContextDataWriteFunc)},
+    ExperimentalEntry{"OrtEpApi_SessionOptions_GetEpContextConfig_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtExecutionProviderApi::SessionOptionsGetEpContextConfig)},
+    ExperimentalEntry{"OrtEpApi_ReleaseEpContextConfig_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtExecutionProviderApi::ReleaseEpContextConfig)},
+    ExperimentalEntry{"OrtEpApi_EpContextConfig_GetEpContextDataReadFunc_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtExecutionProviderApi::EpContextConfigGetEpContextDataReadFunc)},
+    ExperimentalEntry{"OrtEpApi_EpContextConfig_GetEpContextDataWriteFunc_SinceV28",
+                      reinterpret_cast<OrtExperimentalFnPtr>(&OrtExecutionProviderApi::EpContextConfigGetEpContextDataWriteFunc)},
+#endif
 
 };
 
