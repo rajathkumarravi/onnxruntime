@@ -322,6 +322,52 @@ TEST_F(GraphTest, SimpleAddDefaultDomain) {
   ASSERT_STATUS_OK(Model::Load(std::move(m), model, nullptr, *logger_));
 }
 
+#if !defined(DISABLE_CONTRIB_OPS) && !defined(DISABLE_FLOAT8_TYPES)
+TEST_F(GraphTest, EPContextPreservesFloat8WithMixedPrecisionIO) {
+  for (const int cache_type : {TensorProto_DataType_FLOAT8E4M3FN,
+                               TensorProto_DataType_FLOAT8E4M3FNUZ,
+                               TensorProto_DataType_FLOAT8E5M2,
+                               TensorProto_DataType_FLOAT8E5M2FNUZ}) {
+    SCOPED_TRACE(cache_type);
+    ModelProto proto;
+    proto.set_ir_version(9);
+    ImportOpset(proto, "", 21);
+    ImportOpset(proto, kMSDomain, 1);
+    auto& graph = *proto.mutable_graph();
+    graph.set_name("float8_context");
+    auto add_port = [](ValueInfoProto* port, const char* name, int type, const std::vector<int64_t>& shape) {
+      port->set_name(name);
+      SetTypeAndShape(port->mutable_type()->mutable_tensor_type(), type, shape);
+    };
+    add_port(graph.add_input(), "query", TensorProto_DataType_FLOAT16, {1, 1, 128});
+    add_port(graph.add_input(), "past", cache_type, {1, 1, 16, 128});
+    add_port(graph.add_input(), "mask", TensorProto_DataType_FLOAT16, {1, 1, 1, 16});
+    add_port(graph.add_output(), "output", TensorProto_DataType_FLOAT16, {1, 1, 128});
+    add_port(graph.add_output(), "present", cache_type, {1, 1, 16, 128});
+    auto& node = *graph.add_node();
+    node.set_name("context");
+    node.set_op_type("EPContext");
+    node.set_domain(kMSDomain);
+    for (const char* name : {"query", "past", "mask"}) {
+      node.add_input(name);
+    }
+    node.add_output("output");
+    node.add_output("present");
+
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(std::move(proto), model, nullptr, *logger_));
+    auto serialized = model->ToProto();
+    std::shared_ptr<Model> reloaded;
+    ASSERT_STATUS_OK(Model::Load(std::move(serialized), reloaded, nullptr, *logger_));
+    const auto& loaded = reloaded->MainGraph();
+    EXPECT_EQ(loaded.GetInputs()[0]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
+    EXPECT_EQ(loaded.GetInputs()[1]->TypeAsProto()->tensor_type().elem_type(), cache_type);
+    EXPECT_EQ(loaded.GetInputs()[2]->TypeAsProto()->tensor_type().elem_type(), TensorProto_DataType_FLOAT16);
+    EXPECT_EQ(loaded.GetOutputs()[1]->TypeAsProto()->tensor_type().elem_type(), cache_type);
+  }
+}
+#endif
+
 TEST_F(GraphTest, ModelEditorPreservesTensorElementTypes) {
   const std::pair<ONNXTensorElementDataType, int> element_types[] = {
       {ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, TensorProto_DataType_FLOAT},
